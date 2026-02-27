@@ -243,8 +243,79 @@ class KeyRotator:
         keys.sort(key=lambda x: x['score'])
         return keys
 
+    def get_active_key(self, provider='google'):
+        """Get the ACTUAL active key from auth.json (what OpenClaw is using right now).
+        This is the source of truth - not profiles, not lastGood, not best-available."""
+        auth = load_json(str(self.auth_json_path))
+        active_key = auth.get(provider, {}).get('key', '')
+        if not active_key:
+            return None, None, None
+
+        # Find the profile name and bucket for this key
+        self.load()
+        for name, profile in self.data.get('profiles', {}).items():
+            if profile.get('key') == active_key:
+                bucket = profile.get('bucket', 'default')
+                return name, active_key, bucket
+
+        # Key exists in auth.json but not in profiles (manually set?)
+        return None, active_key, 'unknown'
+
+    def check_active(self, provider='google'):
+        """Test the actual active key and return result.
+        Shared codepath for health, test, and polling."""
+        name, key, bucket = self.get_active_key(provider)
+        if not key:
+            return None, None, None, "no_key"
+
+        result = self._ping_key(key)
+        return name, key, bucket, result
+
+    @staticmethod
+    def _ping_key(key):
+        """Send a minimal API request to test a key. Returns:
+        ok, rate_limit, dead, transient, error, unknown"""
+        try:
+            import urllib.request
+            import urllib.error
+
+            url = (f"https://generativelanguage.googleapis.com/v1beta/"
+                   f"models/gemini-2.0-flash:generateContent?key={key}")
+            data = json.dumps({
+                "contents": [{"parts": [{"text": "ping"}]}],
+                "generationConfig": {"maxOutputTokens": 5}
+            }).encode()
+
+            req = urllib.request.Request(
+                url, data=data,
+                headers={"Content-Type": "application/json"}
+            )
+            response = urllib.request.urlopen(req, timeout=15)
+            body = response.read().decode()
+            if '"text"' in body:
+                return "ok"
+            return "unknown"
+
+        except urllib.error.HTTPError as e:
+            body = ""
+            try:
+                body = e.read().decode()
+            except:
+                pass
+            if e.code == 429 or "RESOURCE_EXHAUSTED" in body:
+                return "rate_limit"
+            if "API_KEY_INVALID" in body or "PERMISSION_DENIED" in body:
+                return "dead"
+            if e.code >= 500:
+                return "transient"
+            return "error"
+        except Exception:
+            return "error"
+
     def get_best_key(self, provider='google', _skip_reload=False):
-        """Get the best available key, preferring non-cooling buckets."""
+        """Get the best available key, preferring non-cooling buckets.
+        Used by rotate() to pick the NEXT key. For testing the CURRENT
+        key, use get_active_key() instead."""
         if not _skip_reload:
             self.load()
         keys = self.get_provider_keys(provider)
@@ -538,60 +609,22 @@ class LogWatcher:
         print(f"  Polling mode: testing active key every {POLL_INTERVAL}s...")
         while self.running:
             try:
-                self.rotator.load()
-                name, key, bucket = self.rotator.get_best_key('google')
-                if key:
-                    result = self._test_key(key)
-                    ts = datetime.now().strftime('%H:%M:%S')
-                    if result == "rate_limit":
-                        print(f"  [{ts}] Active key rate limited")
-                        self.handle_error("rate_limit")
-                    elif result == "dead":
-                        print(f"  [{ts}] Active key is dead")
-                        self.handle_error("dead")
-                    elif result == "ok":
-                        self.rotator.report_success('google')
+                name, key, bucket, result = self.rotator.check_active('google')
+                if not key:
+                    time.sleep(POLL_INTERVAL)
+                    continue
+                ts = datetime.now().strftime('%H:%M:%S')
+                if result == "rate_limit":
+                    print(f"  [{ts}] Active key rate limited")
+                    self.handle_error("rate_limit")
+                elif result == "dead":
+                    print(f"  [{ts}] Active key is dead")
+                    self.handle_error("dead")
+                elif result == "ok":
+                    self.rotator.report_success('google')
                 time.sleep(POLL_INTERVAL)
             except KeyboardInterrupt:
                 break
-
-    def _test_key(self, key):
-        try:
-            import urllib.request
-            import urllib.error
-
-            url = (f"https://generativelanguage.googleapis.com/v1beta/"
-                   f"models/gemini-2.0-flash:generateContent?key={key}")
-            data = json.dumps({
-                "contents": [{"parts": [{"text": "ping"}]}],
-                "generationConfig": {"maxOutputTokens": 5}
-            }).encode()
-
-            req = urllib.request.Request(
-                url, data=data,
-                headers={"Content-Type": "application/json"}
-            )
-            response = urllib.request.urlopen(req, timeout=15)
-            body = response.read().decode()
-            if '"text"' in body:
-                return "ok"
-            return "unknown"
-
-        except urllib.error.HTTPError as e:
-            body = ""
-            try:
-                body = e.read().decode()
-            except:
-                pass
-            if e.code == 429 or "RESOURCE_EXHAUSTED" in body:
-                return "rate_limit"
-            if "API_KEY_INVALID" in body or "PERMISSION_DENIED" in body:
-                return "dead"
-            if e.code >= 500:
-                return "transient"
-            return "error"
-        except Exception:
-            return "error"
 
     def start(self):
         ts = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
@@ -643,44 +676,40 @@ class LogWatcher:
 #  HEALTH / TEST COMMANDS
 # ================================================================
 
+RESULT_MSG = {
+    "ok": "[OK] Key is working",
+    "rate_limit": "[!!] Key is rate limited",
+    "dead": "[XX] Key is invalid or disabled",
+    "transient": "[!!] Transient error (5xx)",
+    "error": "[??] Could not reach API",
+    "unknown": "[??] Unexpected response",
+    "no_key": "[XX] No active key in auth.json",
+}
+
+
 def health_check():
+    """Quick health ping on the ACTUAL active key (from auth.json). No rotation."""
     rotator = KeyRotator()
-    name, key, bucket = rotator.get_best_key('google')
+    name, key, bucket, result = rotator.check_active('google')
     if not key:
-        print("  XX No keys configured")
+        print(f"  {RESULT_MSG['no_key']}")
         return
-    print(f"  Pinging {name} (bucket: {bucket})...")
-    watcher = LogWatcher(rotator)
-    result = watcher._test_key(key)
-    msg = {
-        "ok": "[OK] Key is working",
-        "rate_limit": "[!!] Key is rate limited",
-        "dead": "[XX] Key is invalid or disabled",
-        "transient": "[!!] Transient error (5xx)",
-        "error": "[??] Could not reach API",
-        "unknown": "[??] Unexpected response",
-    }
-    print(f"  {msg.get(result, result)}")
+    suffix = f" (bucket: {bucket})" if bucket != "unknown" else ""
+    print(f"  Pinging active key: {name or '?'} (...{key[-8:]}){suffix}")
+    print(f"  {RESULT_MSG.get(result, result)}")
     return result
 
 
 def test_and_rotate():
+    """Test the ACTUAL active key (from auth.json). Rotate if bad."""
     rotator = KeyRotator()
-    name, key, bucket = rotator.get_best_key('google')
+    name, key, bucket, result = rotator.check_active('google')
     if not key:
-        print("  XX No keys configured")
+        print(f"  {RESULT_MSG['no_key']}")
         return
-    print(f"  Testing {name} (...{key[-8:]}, bucket: {bucket})...")
-    watcher = LogWatcher(rotator)
-    result = watcher._test_key(key)
-    msg = {
-        "ok": "[OK] Key is working",
-        "rate_limit": "[!!] Key is rate limited",
-        "dead": "[XX] Key is invalid or disabled",
-        "transient": "[!!] Transient error",
-        "error": "[??] Could not reach API",
-    }
-    print(f"  {msg.get(result, result)}")
+    suffix = f" (bucket: {bucket})" if bucket != "unknown" else ""
+    print(f"  Testing active key: {name or '?'} (...{key[-8:]}){suffix}")
+    print(f"  {RESULT_MSG.get(result, result)}")
     if result == "rate_limit":
         print("  Rotating (bucket cooldown)...")
         rotator.rotate('google', reason="test_429")
