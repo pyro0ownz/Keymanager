@@ -1,42 +1,39 @@
 #!/usr/bin/env python3
 """
-╔══════════════════════════════════════════════════════════════════╗
-║  OpenClaw Key Manager v3.2                                      ║
-║  Multi-Provider Key Pool + Device Identity Management           ║
-║  Built for OpenClaw 2026.2.24+                                  ║
-╚══════════════════════════════════════════════════════════════════╝
++==================================================================+
+|  OpenClaw Key Manager v4.0                                       |
+|  Multi-Provider Key Pool + Bucket-Aware Rotation                 |
+|  Built for OpenClaw 2026.2.24+                                   |
++==================================================================+
 
 Files touched:
-  ~/.openclaw/agents/main/agent/auth-profiles.json   (key pool + stats)
+  ~/.openclaw/agents/main/agent/auth-profiles.json   (key pool + stats + buckets)
   ~/.openclaw/agents/main/agent/auth.json             (active key)
   ~/.openclaw/agents/main/agent/models.json           (provider defs)
   ~/.openclaw/openclaw.json                           (env, auth, models, whitelist)
-  ~/.openclaw/device.json                             (Ed25519 identity)
+  ~/.openclaw/device.json                             (Ed25519 identity - OPT-IN only)
 
-Changelog v3.2 (from actual working openclaw.json analysis):
-  - FIXED: Google is now handled as NATIVE provider — does NOT inject into
-    models.providers (OpenClaw manages Google natively via auth profiles).
-    v3.0 was injecting "api": "google" which is invalid and broke the config.
-  - FIXED: Google setup only touches env, auth.profiles, and the whitelist.
-    models.providers is left alone for Google. Other providers (nvidia-nim,
-    groq, etc.) still use models.providers with "api": "openai-completions".
-  - FIXED: --fix now removes the invalid google entry from models.providers
-  - ADDED: --fix flag to repair broken configs from v3.0
-  - ADDED: --status to show current key pool state
-  - ADDED: --remove to cleanly remove a provider
-  - ADDED: Better error handling and validation throughout
-  - ADDED: Pre-flight checks before writing any files
-  - IMPROVED: Key prefix validation with clearer messaging
-  - IMPROVED: Backup naming with ISO timestamps
+Changelog v4.0 (from Krill review + upstream PR prep):
+  - ADDED: Bucket/project tagging in keys.txt (# bucket=projA)
+  - ADDED: bucketStats in auth-profiles.json for project-level cooldown
+  - ADDED: Atomic writes (temp file + rename) to prevent corruption
+  - ADDED: File locking to prevent race conditions with rotator daemon
+  - CHANGED: Device rotation is now OPT-IN (--rotate-device flag)
+  - CHANGED: --status counts models from whitelist, not models.json
+  - FIXED: Duplicate-keys-only crash in step_auth_profiles()
+  - FIXED: read_keys() now returns structured entries with bucket metadata
+  - KEPT: Google as native provider (no models.providers injection)
+  - KEPT: All v3.2 features (--fix, --status, --remove, pre-flight)
 """
 
-import json, os, sys, shutil, subprocess, hashlib, secrets, time
+import json, os, sys, shutil, subprocess, hashlib, secrets, time, fcntl, tempfile
+import random
 from datetime import datetime
 from pathlib import Path
 
-# ═══════════════════════════════════════════════════════════════════
+# ===================================================================
 #  Ed25519 KEY GENERATION (multi-method fallback)
-# ═══════════════════════════════════════════════════════════════════
+# ===================================================================
 
 def _ed25519_generate():
     """Generate Ed25519 keypair. Tries three methods in order."""
@@ -109,7 +106,7 @@ def _ed25519_generate():
     except Exception as e:
         errors.append(f"PyNaCl: {e}")
 
-    print("\n  ✗ Cannot generate Ed25519 keys. Tried:")
+    print("\n  XX Cannot generate Ed25519 keys. Tried:")
     for e in errors:
         print(f"    - {e}")
     print("\n  Fix: pip install cryptography --break-system-packages")
@@ -130,25 +127,18 @@ def generate_device():
     }
 
 
-# ═══════════════════════════════════════════════════════════════════
+# ===================================================================
 #  PROVIDER CATALOG
-#
-#  api types: "google-genai" for native Google, "openai-completions"
-#  for OpenAI-compatible endpoints.
-#
-#  url: Set to None for providers that don't need baseUrl (Google).
-#       OpenClaw validates baseUrl as a required string IF present,
-#       so we must OMIT it entirely for Google, not set it to null.
-# ═══════════════════════════════════════════════════════════════════
+# ===================================================================
 
 PROVIDERS = {
     "google": {
         "name": "Google Gemini (AI Studio)",
-        "api": "native",  # Google is handled NATIVELY by OpenClaw — NOT through models.providers
+        "api": "native",
         "url": None,
         "prefix": "AIzaSy",
         "free": True,
-        "native": True,  # Flag: skip models.providers injection, use auth profiles only
+        "native": True,
         "info": "15 RPM, 1M TPD free | ai.google.dev",
         "env": "GOOGLE_API_KEY",
         "models": [
@@ -172,6 +162,7 @@ PROVIDERS = {
         "url": "https://api.groq.com/openai/v1",
         "prefix": "gsk_",
         "free": True,
+        "native": False,
         "info": "30 RPM free | console.groq.com",
         "env": "GROQ_API_KEY",
         "models": [
@@ -195,6 +186,7 @@ PROVIDERS = {
         "url": "https://integrate.api.nvidia.com/v1",
         "prefix": "nvapi-",
         "free": True,
+        "native": False,
         "info": "1000 req/day free | build.nvidia.com",
         "env": "NVIDIA_API_KEY",
         "models": [
@@ -222,6 +214,7 @@ PROVIDERS = {
         "url": "https://openrouter.ai/api/v1",
         "prefix": "sk-or-",
         "free": True,
+        "native": False,
         "info": "Free models | openrouter.ai",
         "env": "OPENROUTER_API_KEY",
         "models": [
@@ -241,6 +234,7 @@ PROVIDERS = {
         "url": "https://api.mistral.ai/v1",
         "prefix": "",
         "free": True,
+        "native": False,
         "info": "Free tier | console.mistral.ai",
         "env": "MISTRAL_API_KEY",
         "models": [
@@ -258,6 +252,7 @@ PROVIDERS = {
         "url": "https://api.together.xyz/v1",
         "prefix": "",
         "free": True,
+        "native": False,
         "info": "$5 free | api.together.ai",
         "env": "TOGETHER_API_KEY",
         "models": [
@@ -275,6 +270,7 @@ PROVIDERS = {
         "url": "https://api.cerebras.ai/v1",
         "prefix": "csk-",
         "free": True,
+        "native": False,
         "info": "30 RPM free | cloud.cerebras.ai",
         "env": "CEREBRAS_API_KEY",
         "models": [
@@ -290,6 +286,7 @@ PROVIDERS = {
         "url": "https://api.sambanova.ai/v1",
         "prefix": "",
         "free": True,
+        "native": False,
         "info": "Free | cloud.sambanova.ai",
         "env": "SAMBANOVA_API_KEY",
         "models": [
@@ -305,6 +302,7 @@ PROVIDERS = {
         "url": "https://api.deepseek.com/v1",
         "prefix": "sk-",
         "free": False,
+        "native": False,
         "info": "$0.14/M input | platform.deepseek.com",
         "env": "DEEPSEEK_API_KEY",
         "models": [
@@ -320,6 +318,7 @@ PROVIDERS = {
         "url": "https://api.hyperbolic.xyz/v1",
         "prefix": "",
         "free": True,
+        "native": False,
         "info": "$10 free | app.hyperbolic.xyz",
         "env": "HYPERBOLIC_API_KEY",
         "models": [
@@ -331,9 +330,9 @@ PROVIDERS = {
     },
 }
 
-# ═══════════════════════════════════════════════════════════════════
+# ===================================================================
 #  PATHS
-# ═══════════════════════════════════════════════════════════════════
+# ===================================================================
 
 OPENCLAW_DIR   = os.path.expanduser("~/.openclaw")
 AGENT_DIR      = os.path.join(OPENCLAW_DIR, "agents/main/agent")
@@ -344,61 +343,108 @@ OPENCLAW_JSON  = os.path.join(OPENCLAW_DIR, "openclaw.json")
 DEVICE_JSON    = os.path.join(OPENCLAW_DIR, "device.json")
 KEYS_FILE      = "keys.txt"
 
-# ═══════════════════════════════════════════════════════════════════
-#  HELPERS
-# ═══════════════════════════════════════════════════════════════════
+# ===================================================================
+#  HELPERS - ATOMIC FILE I/O WITH LOCKING
+# ===================================================================
 
 def load_json(path):
-    """Load JSON file, return empty dict if missing or corrupt."""
+    """Load JSON file with shared lock, return empty dict if missing or corrupt."""
     if not os.path.exists(path):
         return {}
     try:
         with open(path, 'r') as f:
-            return json.load(f)
+            fcntl.flock(f, fcntl.LOCK_SH)
+            try:
+                return json.load(f)
+            finally:
+                fcntl.flock(f, fcntl.LOCK_UN)
     except json.JSONDecodeError as e:
-        print(f"  ⚠  {os.path.basename(path)} has invalid JSON: {e}")
-        print(f"     Backup will be created before overwriting.")
+        print(f"  [!!] {os.path.basename(path)} has invalid JSON: {e}")
+        print(f"       Backup will be created before overwriting.")
         return {}
     except PermissionError:
-        print(f"  ✗  Cannot read {path} — permission denied")
+        print(f"  XX Cannot read {path} - permission denied")
         sys.exit(1)
 
 
 def save_json(path, data):
-    """Save JSON with timestamped backup of existing file."""
+    """Atomic save: write to temp file, fsync, rename. With exclusive lock."""
     os.makedirs(os.path.dirname(path), exist_ok=True)
+
+    # Backup existing file
     if os.path.exists(path):
         ts = datetime.now().strftime("%Y%m%d_%H%M%S")
         backup = f"{path}.bak.{ts}"
         shutil.copy2(path, backup)
-    with open(path, 'w') as f:
-        json.dump(data, f, indent=2, ensure_ascii=False)
-    print(f"    ✓ {os.path.basename(path)}")
+
+    # Atomic write: temp file in same directory + rename
+    dir_name = os.path.dirname(path)
+    try:
+        fd, tmp_path = tempfile.mkstemp(dir=dir_name, suffix='.tmp')
+        with os.fdopen(fd, 'w') as f:
+            fcntl.flock(f, fcntl.LOCK_EX)
+            json.dump(data, f, indent=2, ensure_ascii=False)
+            f.flush()
+            os.fsync(f.fileno())
+            fcntl.flock(f, fcntl.LOCK_UN)
+        os.rename(tmp_path, path)
+        print(f"    OK {os.path.basename(path)}")
+    except Exception as e:
+        # Clean up temp file on failure
+        if 'tmp_path' in locals() and os.path.exists(tmp_path):
+            os.unlink(tmp_path)
+        print(f"  XX Failed to write {path}: {e}")
+        raise
 
 
 def read_keys(keys_file=None):
-    """Read API keys from file, one per line. Lines starting with # are comments."""
+    """Read API keys from file with optional bucket metadata.
+
+    Format:
+      AIzaSy....                    -> key with bucket="default"
+      AIzaSy.... # bucket=projA     -> key with bucket="projA"
+      # comment lines are skipped
+      (blank lines are skipped)
+
+    Returns list of dicts: [{"key": "...", "bucket": "..."}]
+    """
     kf = keys_file or KEYS_FILE
     if not os.path.exists(kf):
-        print(f"\n  ✗ {kf} not found")
+        print(f"\n  XX {kf} not found")
         print(f"    Create it with one API key per line:")
-        print(f"    echo 'AIzaSy...' > {kf}")
+        print(f"    echo 'AIzaSy... # bucket=projA' > {kf}")
         sys.exit(1)
-    keys = []
+
+    entries = []
     with open(kf) as f:
         for line_num, line in enumerate(f, 1):
             stripped = line.strip()
             if not stripped or stripped.startswith('#'):
                 continue
-            # Strip inline comments
+
+            # Parse key and optional metadata from inline comment
+            bucket = "default"
+            key_part = stripped
+
             if ' #' in stripped:
-                stripped = stripped.split(' #')[0].strip()
-            if stripped:
-                keys.append(stripped)
-    if not keys:
-        print(f"\n  ✗ {kf} has no keys (only blank lines/comments)")
+                key_part, comment = stripped.split(' #', 1)
+                key_part = key_part.strip()
+                comment = comment.strip()
+
+                # Parse bucket=VALUE from comment
+                for token in comment.split():
+                    if token.startswith("bucket="):
+                        bucket = token.split("=", 1)[1]
+                    elif token.startswith("provider="):
+                        pass  # reserved for future use
+
+            if key_part:
+                entries.append({"key": key_part, "bucket": bucket})
+
+    if not entries:
+        print(f"\n  XX {kf} has no keys (only blank lines/comments)")
         sys.exit(1)
-    return keys
+    return entries
 
 
 def model_schema(m):
@@ -415,16 +461,13 @@ def model_schema(m):
 
 
 def build_provider_entry(pk):
-    """Build a provider config entry. Omits baseUrl for providers that don't use it."""
+    """Build a provider config entry. Omits baseUrl for native providers."""
     p = PROVIDERS[pk]
     entry = {
         "api": p["api"],
         "models": [model_schema(m) for m in p["models"]],
         "apiKey": p["env"],
     }
-    # CRITICAL: Only include baseUrl if the provider has one.
-    # Google uses native API — no baseUrl. OpenClaw validates baseUrl
-    # as a required string IF the key exists, so we must OMIT it entirely.
     if p["url"] is not None:
         entry["baseUrl"] = p["url"]
     return entry
@@ -438,54 +481,60 @@ def build_provider_entry_with_envref(pk, key):
         "api": p["api"],
         "models": [model_schema(m) for m in p["models"]],
     }
-    # Same rule: omit baseUrl entirely for Google
     if p["url"] is not None:
         entry["baseUrl"] = p["url"]
     return entry
 
 
-# ═══════════════════════════════════════════════════════════════════
+def whitelist_model_count(provider):
+    """Count models from openclaw.json whitelist (agents.defaults.models).
+    This is the authoritative source - what OpenClaw /models actually shows."""
+    c = load_json(OPENCLAW_JSON)
+    wl = c.get("agents", {}).get("defaults", {}).get("models", {})
+    return sum(1 for k in wl if k.startswith(f"{provider}/"))
+
+
+# ===================================================================
 #  PRE-FLIGHT CHECKS
-# ═══════════════════════════════════════════════════════════════════
+# ===================================================================
 
 def preflight():
     """Verify OpenClaw installation exists before touching anything."""
     issues = []
     if not os.path.isdir(OPENCLAW_DIR):
-        issues.append(f"~/.openclaw directory not found")
+        issues.append("~/.openclaw directory not found")
     if not os.path.isdir(AGENT_DIR):
         issues.append(f"Agent directory not found: {AGENT_DIR}")
     if not os.path.exists(OPENCLAW_JSON):
-        issues.append(f"openclaw.json not found")
+        issues.append("openclaw.json not found")
 
     if issues:
-        print("\n  ✗ Pre-flight check failed:")
+        print("\n  XX Pre-flight check failed:")
         for i in issues:
             print(f"    - {i}")
         print("\n  Is OpenClaw installed? Run: openclaw --version")
         sys.exit(1)
 
-    # Verify openclaw.json is valid JSON
     try:
         with open(OPENCLAW_JSON) as f:
             json.load(f)
     except json.JSONDecodeError as e:
-        print(f"\n  ✗ openclaw.json is corrupt: {e}")
+        print(f"\n  XX openclaw.json is corrupt: {e}")
         print(f"    Run: openclaw doctor --fix")
         sys.exit(1)
 
     return True
 
 
-# ═══════════════════════════════════════════════════════════════════
+# ===================================================================
 #  CONFIG REPAIR (--fix)
-# ═══════════════════════════════════════════════════════════════════
+# ===================================================================
 
 def fix_config():
-    """Repair known v3.0 issues in openclaw.json and models.json."""
-    print("\n  ╔══════════════════════════════════════════════════╗")
-    print("  ║  Config Repair                                    ║")
-    print("  ╚══════════════════════════════════════════════════╝")
+    """Repair known v3.0/v3.2 issues in openclaw.json and models.json."""
+    print("\n  +==================================================+")
+    print("  |  Config Repair                                    |")
+    print("  +==================================================+")
 
     fixed = 0
 
@@ -494,20 +543,15 @@ def fix_config():
     if c:
         providers = c.get("models", {}).get("providers", {})
 
-        # Fix 1: Remove Google from models.providers entirely
-        # OpenClaw handles Google natively via auth profiles.
-        # v3.0 injected it with "api": "google" which is invalid.
         if "google" in providers:
             del providers["google"]
-            print("  ✓ Removed 'google' from models.providers (native provider)")
-            print("    Google is handled through auth profiles, not models.providers")
+            print("  OK Removed 'google' from models.providers (native provider)")
             fixed += 1
 
-        # Fix 2: Remove null/undefined baseUrl from any provider
         for pk, prov in list(providers.items()):
             if "baseUrl" in prov and (prov["baseUrl"] is None or prov["baseUrl"] == ""):
                 del prov["baseUrl"]
-                print(f"  ✓ Removed empty baseUrl from {pk}")
+                print(f"  OK Removed empty baseUrl from {pk}")
                 fixed += 1
 
         if fixed > 0:
@@ -519,16 +563,15 @@ def fix_config():
         m_fixed = 0
         m_providers = m.get("providers", {})
 
-        # Same fix: remove Google from models.json providers
         if "google" in m_providers:
             del m_providers["google"]
-            print("  ✓ Removed 'google' from models.json providers")
+            print("  OK Removed 'google' from models.json providers")
             m_fixed += 1
 
         for pk, prov in list(m_providers.items()):
             if "baseUrl" in prov and (prov["baseUrl"] is None or prov["baseUrl"] == ""):
                 del prov["baseUrl"]
-                print(f"  ✓ Removed empty baseUrl from models.json/{pk}")
+                print(f"  OK Removed empty baseUrl from models.json/{pk}")
                 m_fixed += 1
 
         if m_fixed > 0:
@@ -536,28 +579,27 @@ def fix_config():
             fixed += m_fixed
 
     if fixed == 0:
-        print("\n  ✓ No issues found — config looks clean")
+        print("\n  OK No issues found - config looks clean")
     else:
-        print(f"\n  ✓ Fixed {fixed} issue(s)")
-        print("  → Run: openclaw doctor")
-        print("  → Then: openclaw gateway restart")
+        print(f"\n  OK Fixed {fixed} issue(s)")
+        print("  -> Run: openclaw doctor")
+        print("  -> Then: openclaw gateway restart")
 
     return fixed
 
 
-# ═══════════════════════════════════════════════════════════════════
-#  STATUS DISPLAY
-# ═══════════════════════════════════════════════════════════════════
+# ===================================================================
+#  STATUS DISPLAY (counts from whitelist, not models.json)
+# ===================================================================
 
 def show_status():
     """Display current state of all configured providers and keys."""
-    print("\n  ╔══════════════════════════════════════════════════╗")
-    print("  ║  Key Pool Status                                  ║")
-    print("  ╚══════════════════════════════════════════════════╝")
+    print("\n  +==================================================+")
+    print("  |  Key Pool Status                                  |")
+    print("  +==================================================+")
 
     profiles = load_json(AUTH_PROFILES)
     auth = load_json(AUTH_JSON)
-    models = load_json(MODELS_JSON)
 
     if not profiles.get("profiles"):
         print("\n  No keys configured yet. Run the manager to add keys.")
@@ -571,53 +613,68 @@ def show_status():
 
     stats = profiles.get("usageStats", {})
     last_good = profiles.get("lastGood", {})
+    bucket_stats = profiles.get("bucketStats", {})
+    now = time.time()
 
     for prov, aliases in sorted(by_provider.items()):
         active_key = auth.get(prov, {}).get("key", "")
-        model_count = len(models.get("providers", {}).get(prov, {}).get("models", []))
-        print(f"\n  ── {prov} ({len(aliases)} keys, {model_count} models) ──")
+        # Count from whitelist (authoritative), not models.json
+        model_count = whitelist_model_count(prov)
+        print(f"\n  -- {prov} ({len(aliases)} keys, {model_count} models) --")
+
+        # Show bucket cooldown status if any
+        prov_buckets = {k: v for k, v in bucket_stats.items() if k.startswith(f"{prov}/")}
+        if prov_buckets:
+            for bk, bs in sorted(prov_buckets.items()):
+                cd_until = bs.get("cooldownUntilMs", 0) / 1000
+                consec = bs.get("consecutive429", 0)
+                if cd_until > now:
+                    remaining = int(cd_until - now)
+                    print(f"    BUCKET {bk}: cooling {remaining}s (streak: {consec})")
+                elif consec > 0:
+                    print(f"    BUCKET {bk}: ready (last streak: {consec})")
 
         for alias in sorted(aliases):
             key = profiles["profiles"][alias].get("key", "???")
+            bucket = profiles["profiles"][alias].get("bucket", "default")
             s = stats.get(alias, {})
             errs = s.get("errorCount", 0)
             last_fail = s.get("lastFailureAt", 0)
 
-            # Status icon
             if errs == 0:
-                icon = "✅"
+                icon = "[OK]"
             elif errs <= 3:
-                icon = "🟡"
+                icon = "[--]"
+            elif errs >= 100:
+                icon = "[DEAD]"
             else:
-                icon = "⚠️ "
+                icon = "[!!]"
 
-            # Active marker
-            active = " ◄ ACTIVE" if key == active_key else ""
+            active = " < ACTIVE" if key == active_key else ""
 
-            # Cooldown check
             cooldown = ""
             if last_fail > 0:
-                elapsed = time.time() - (last_fail / 1000 if last_fail > 1e10 else last_fail)
-                if elapsed < 60:
-                    cooldown = f" (cooling {60-int(elapsed)}s)"
+                elapsed = now - (last_fail / 1000 if last_fail > 1e10 else last_fail)
+                if elapsed < 65:
+                    cooldown = f" (cooling {65 - int(elapsed)}s)"
 
-            print(f"    {icon} {alias:<25} ...{key[-8:]}  "
-                  f"err:{errs}{cooldown}{active}")
+            bucket_tag = f" [{bucket}]" if bucket != "default" else ""
+            print(f"    {icon} {alias:<22} ...{key[-8:]}  "
+                  f"err:{errs}{bucket_tag}{cooldown}{active}")
 
         if prov in last_good:
             print(f"    Last good: {last_good[prov]}")
 
 
-# ═══════════════════════════════════════════════════════════════════
+# ===================================================================
 #  PROVIDER REMOVAL
-# ═══════════════════════════════════════════════════════════════════
+# ===================================================================
 
 def remove_provider(pk):
     """Cleanly remove a provider from all config files."""
     print(f"\n  Removing {pk} from all configs...")
     removed = 0
 
-    # auth-profiles.json
     ap = load_json(AUTH_PROFILES)
     for key in list(ap.get("profiles", {}).keys()):
         if key.startswith(f"{pk}:"):
@@ -626,24 +683,25 @@ def remove_provider(pk):
                 del ap["usageStats"][key]
             removed += 1
     ap.get("lastGood", {}).pop(pk, None)
+    # Clean bucket stats
+    for bk in list(ap.get("bucketStats", {}).keys()):
+        if bk.startswith(f"{pk}/"):
+            del ap["bucketStats"][bk]
     if removed:
         save_json(AUTH_PROFILES, ap)
 
-    # auth.json
     auth = load_json(AUTH_JSON)
     if pk in auth:
         del auth[pk]
         save_json(AUTH_JSON, auth)
         removed += 1
 
-    # models.json
     models = load_json(MODELS_JSON)
     if pk in models.get("providers", {}):
         del models["providers"][pk]
         save_json(MODELS_JSON, models)
         removed += 1
 
-    # openclaw.json
     c = load_json(OPENCLAW_JSON)
     p_info = PROVIDERS.get(pk, {})
     if p_info:
@@ -656,212 +714,252 @@ def remove_provider(pk):
             del wl[key]
     save_json(OPENCLAW_JSON, c)
 
-    print(f"\n  ✓ Removed {pk} ({removed} entries cleaned)")
-    print("  → Run: openclaw gateway restart")
+    print(f"\n  OK Removed {pk} ({removed} entries cleaned)")
+    print("  -> Run: openclaw gateway restart")
 
 
-# ═══════════════════════════════════════════════════════════════════
-#  THE FIVE SETUP STEPS
-# ═══════════════════════════════════════════════════════════════════
+# ===================================================================
+#  THE SETUP STEPS (4 by default, 5 with --rotate-device)
+# ===================================================================
 
-def step_auth_profiles(pk, keys):
-    """Step 1: auth-profiles.json — build/merge key pool with usage stats."""
+def step_auth_profiles(pk, key_entries):
+    """Step 1: auth-profiles.json - build/merge key pool with bucket metadata.
+
+    key_entries: list of {"key": "...", "bucket": "..."} from read_keys()
+    """
     d = load_json(AUTH_PROFILES)
     d.setdefault("version", 1)
     d.setdefault("profiles", {})
     d.setdefault("lastGood", {})
     d.setdefault("usageStats", {})
+    d.setdefault("bucketStats", {})
 
-    # Find existing key count for this provider to avoid overwriting
     existing = [k for k in d["profiles"] if k.startswith(f"{pk}:")]
-    start_idx = len(existing) + 1
+    next_idx = len(existing) + 1
 
-    aliases = []
-    for i, key in enumerate(keys):
-        # Check if this key already exists
+    new_aliases = []
+    seen_buckets = set()
+
+    for entry in key_entries:
+        key = entry["key"]
+        bucket = entry["bucket"]
+        seen_buckets.add(bucket)
+
+        # Check for duplicate key
         dupe = False
         for alias, info in d["profiles"].items():
             if info.get("key") == key:
-                aliases.append(alias)
+                # Update bucket if it changed
+                if info.get("bucket") != bucket:
+                    info["bucket"] = bucket
+                new_aliases.append(alias)
                 dupe = True
                 break
         if dupe:
             continue
 
-        idx = start_idx + len(aliases) - len([a for a in aliases if a.startswith(f"{pk}:")])
-        # Recalculate: just use incrementing numbers
-        a = f"{pk}:key{start_idx + i}"
-        # Make sure alias doesn't collide
+        # Find next non-colliding alias
+        a = f"{pk}:key{next_idx}"
         while a in d["profiles"]:
-            start_idx += 1
-            a = f"{pk}:key{start_idx + i}"
+            next_idx += 1
+            a = f"{pk}:key{next_idx}"
 
-        aliases.append(a)
-        d["profiles"][a] = {"type": "api_key", "provider": pk, "key": key}
+        new_aliases.append(a)
+        d["profiles"][a] = {
+            "type": "api_key",
+            "provider": pk,
+            "key": key,
+            "bucket": bucket,
+        }
         d["usageStats"].setdefault(a, {
             "lastUsed": 0, "errorCount": 0, "lastFailureAt": 0
         })
+        next_idx += 1
 
-    # Include existing aliases in the return
-    all_aliases = existing + [a for a in aliases if a not in existing]
-    d["lastGood"][pk] = all_aliases[0] if all_aliases else aliases[0]
+    # Initialize bucket stats for any new buckets
+    for bucket in seen_buckets:
+        bucket_key = f"{pk}/{bucket}"
+        d["bucketStats"].setdefault(bucket_key, {
+            "cooldownUntilMs": 0, "consecutive429": 0, "last429AtMs": 0
+        })
 
-    new_count = len(aliases)
+    # Combine existing + new, guard empty case (Krill bug #3)
+    all_aliases = existing + [a for a in new_aliases if a not in existing]
+    if all_aliases:
+        d["lastGood"][pk] = all_aliases[0]
+    elif new_aliases:
+        d["lastGood"][pk] = new_aliases[0]
+    else:
+        print("  [!!] No new or existing keys for this provider")
+        print("       Check keys.txt for valid entries")
+        return []
+
+    added = len([a for a in new_aliases if a not in existing])
     total = len(all_aliases)
-    print(f"\n  [1/5] auth-profiles.json — {new_count} new, {total} total")
+    buckets = len(seen_buckets)
+    print(f"\n  [1/4] auth-profiles.json - {added} new, {total} total, {buckets} bucket(s)")
     save_json(AUTH_PROFILES, d)
     return all_aliases
 
 
 def step_auth_json(pk, key):
-    """Step 2: auth.json — set active key for provider."""
+    """Step 2: auth.json - set active key for provider."""
     d = load_json(AUTH_JSON)
     d[pk] = {"type": "api_key", "key": key}
-    print(f"\n  [2/5] auth.json — active: ...{key[-8:]}")
+    print(f"\n  [2/4] auth.json - active: ...{key[-8:]}")
     save_json(AUTH_JSON, d)
 
 
 def step_models_json(pk):
-    """Step 3: models.json — register provider and model definitions.
-    SKIPPED for native providers (Google) — OpenClaw handles those internally."""
+    """Step 3: models.json - register provider and model definitions.
+    SKIPPED for native providers (Google)."""
     p = PROVIDERS[pk]
     if p.get("native"):
-        print(f"\n  [3/5] models.json — skipped (native provider)")
+        print(f"\n  [3/4] models.json - skipped (native provider)")
         return
     d = load_json(MODELS_JSON)
     d.setdefault("providers", {})
     d["providers"][pk] = build_provider_entry(pk)
-    print(f"\n  [3/5] models.json — {len(p['models'])} models")
+    print(f"\n  [3/4] models.json - {len(p['models'])} models")
     save_json(MODELS_JSON, d)
 
 
 def step_openclaw_json(pk, key):
-    """Step 4: openclaw.json — env vars, auth profiles, models, whitelist.
-    For native providers (Google): only sets env, auth profile, and whitelist.
-    Does NOT inject into models.providers — OpenClaw handles native providers internally."""
+    """Step 4: openclaw.json - env vars, auth profiles, models, whitelist.
+    Native providers: env + auth + whitelist only (no models.providers)."""
     p = PROVIDERS[pk]
     c = load_json(OPENCLAW_JSON)
     if not c:
-        print("  ✗ Cannot read openclaw.json")
+        print("  XX Cannot read openclaw.json")
         sys.exit(1)
 
-    # env section — always set
     c.setdefault("env", {})[p["env"]] = key
 
-    # auth.profiles — always register
     c.setdefault("auth", {}).setdefault("profiles", {})
     c["auth"]["profiles"][f"{pk}:default"] = {"provider": pk, "mode": "api_key"}
 
-    # models.providers — ONLY for non-native providers
-    # Google is handled natively by OpenClaw. Injecting it into models.providers
-    # with "api": "google" breaks validation. OpenClaw expects Google to be
-    # configured through auth profiles only.
     if not p.get("native"):
         c.setdefault("models", {}).setdefault("providers", {})
         c["models"]["providers"][pk] = build_provider_entry_with_envref(pk, key)
 
-    # agents.defaults.models — whitelist (always)
     wl = c.setdefault("agents", {}).setdefault("defaults", {}).setdefault("models", {})
     for m in p["models"]:
         wl[f"{pk}/{m['id']}"] = {}
 
-    print(f"\n  [4/5] openclaw.json — env + auth + {'models + ' if not p.get('native') else ''}whitelist")
+    native_note = "" if not p.get("native") else " (native)"
+    print(f"\n  [4/4] openclaw.json - env + auth + whitelist{native_note}")
     save_json(OPENCLAW_JSON, c)
 
 
 def step_device():
-    """Step 5: device.json — generate fresh Ed25519 device identity."""
+    """Optional: device.json - generate fresh Ed25519 device identity.
+    Only runs with --rotate-device flag."""
     dev = generate_device()
-    print(f"\n  [5/5] device.json — new identity")
+    print(f"\n  [opt] device.json - new identity")
     save_json(DEVICE_JSON, dev)
-    print(f"    ID: {dev['deviceId'][:16]}...")
+    print(f"        ID: {dev['deviceId'][:16]}...")
     return dev
 
 
-# ═══════════════════════════════════════════════════════════════════
+# ===================================================================
 #  DISPLAY HELPERS
-# ═══════════════════════════════════════════════════════════════════
+# ===================================================================
 
 def show_providers():
-    print("\n  ╔══════════════════════════════════════════════════╗")
-    print("  ║  Providers                                       ║")
-    print("  ╠══════════════════════════════════════════════════╣")
+    print("\n  +==================================================+")
+    print("  |  Providers                                       |")
+    print("  +==================================================+")
     for i, (k, p) in enumerate(PROVIDERS.items(), 1):
-        f = "🟢" if p["free"] else "💰"
-        print(f"  ║  {i:>2}. {p['name']:<32} {f} {len(p['models']):>2}m ║")
-    print("  ╚══════════════════════════════════════════════════╝")
+        f = "[FREE]" if p["free"] else "[PAID]"
+        print(f"  |  {i:>2}. {p['name']:<32} {f} {len(p['models']):>2}m |")
+    print("  +==================================================+")
 
 
 def show_models(pk):
     p = PROVIDERS[pk]
-    print(f"\n  {p['name']} — {p['info']}")
+    print(f"\n  {p['name']} - {p['info']}")
     for m in p["models"]:
         ctx = f"{m['cw']//1000}K" if m['cw'] < 1000000 else f"{m['cw']//1000000}M"
-        r = "🧠" if m.get("r") else "  "
-        print(f"    {r} {m['name']:<38} {ctx}")
+        r = "[R] " if m.get("r") else "    "
+        print(f"    {r}{m['name']:<38} {ctx}")
 
 
-def show_done(pk, keys, aliases):
+def show_done(pk, key_entries, aliases, device_rotated=False):
     p = PROVIDERS[pk]
     pf = load_json(AUTH_PROFILES)
-    print(f"\n  ╔══════════════════════════════════════════════════╗")
-    print(f"  ║  ✅ Setup Complete                                ║")
-    print(f"  ╠══════════════════════════════════════════════════╣")
-    print(f"  ║  {p['name']:<48} ║")
-    print(f"  ║  {len(keys)} keys • {len(p['models'])} models • device rotated       ║")
-    print(f"  ╠══════════════════════════════════════════════════╣")
-    for a in aliases[:10]:  # Show max 10
+    dev_note = "device rotated" if device_rotated else "device unchanged"
+    print(f"\n  +==================================================+")
+    print(f"  |  [OK] Setup Complete                              |")
+    print(f"  +==================================================+")
+    print(f"  |  {p['name']:<48}|")
+    print(f"  |  {len(key_entries)} keys * {len(p['models'])} models * {dev_note:<17}|")
+    print(f"  +==================================================+")
+
+    # Show bucket distribution
+    buckets = {}
+    for e in key_entries:
+        buckets.setdefault(e["bucket"], 0)
+        buckets[e["bucket"]] += 1
+    if len(buckets) > 1 or list(buckets.keys()) != ["default"]:
+        for b, count in sorted(buckets.items()):
+            print(f"  |  bucket={b}: {count} key(s){' ' * (35 - len(b) - len(str(count)))}|")
+        print(f"  +==================================================+")
+
+    for a in aliases[:10]:
         k = pf.get("profiles", {}).get(a, {}).get("key", "?")
         t = f"...{k[-8:]}" if len(k) > 8 else k
-        print(f"  ║  {a:<20} {t:<28} ║")
+        b = pf.get("profiles", {}).get(a, {}).get("bucket", "default")
+        btag = f" [{b}]" if b != "default" else ""
+        line = f"{a}{btag}"
+        print(f"  |  {line:<22} {t:<26}|")
     if len(aliases) > 10:
-        print(f"  ║  ... and {len(aliases)-10} more{' '*33}║")
-    print(f"  ╠══════════════════════════════════════════════════╣")
+        print(f"  |  ... and {len(aliases) - 10} more{' ' * 35}|")
+    print(f"  +==================================================+")
     fm = f"{pk}/{p['models'][0]['id']}"
     if len(fm) > 44:
         fm = fm[:41] + "..."
-    print(f"  ║  /model {fm:<40} ║")
-    print(f"  ╚══════════════════════════════════════════════════╝")
+    print(f"  |  /model {fm:<40}|")
+    print(f"  +==================================================+")
 
 
 def show_help():
     print("""
-  ╔══════════════════════════════════════════════════╗
-  ║  OpenClaw Key Manager v3.2                       ║
-  ╠══════════════════════════════════════════════════╣
-  ║                                                  ║
-  ║  Usage:                                          ║
-  ║    python3 openclaw_key_manage.py                ║
-  ║    python3 openclaw_key_manage.py --status        ║
-  ║    python3 openclaw_key_manage.py --fix           ║
-  ║    python3 openclaw_key_manage.py --remove NAME   ║
-  ║    python3 openclaw_key_manage.py --help          ║
-  ║                                                  ║
-  ║  Commands:                                       ║
-  ║    (no args)    Interactive provider setup        ║
-  ║    --status     Show all keys and providers      ║
-  ║    --fix        Repair broken v3.0 configs       ║
-  ║    --remove     Remove a provider cleanly        ║
-  ║                                                  ║
-  ║  Setup:                                          ║
-  ║    1. Put API keys in keys.txt (one per line)    ║
-  ║    2. Run this script                            ║
-  ║    3. Pick your provider                         ║
-  ║    4. Done — gateway restarts automatically      ║
-  ║                                                  ║
-  ║  Run once per provider. Keys merge, nothing      ║
-  ║  gets overwritten.                               ║
-  ║                                                  ║
-  ╚══════════════════════════════════════════════════╝
+  +==================================================+
+  |  OpenClaw Key Manager v4.0                       |
+  +==================================================+
+  |                                                  |
+  |  Usage:                                          |
+  |    python3 openclaw_key_manage.py                |
+  |    python3 openclaw_key_manage.py --status        |
+  |    python3 openclaw_key_manage.py --fix           |
+  |    python3 openclaw_key_manage.py --remove NAME   |
+  |    python3 openclaw_key_manage.py --rotate-device |
+  |    python3 openclaw_key_manage.py --help          |
+  |                                                  |
+  |  Commands:                                       |
+  |    (no args)       Interactive provider setup     |
+  |    --status        Show all keys and providers   |
+  |    --fix           Repair broken v3.x configs    |
+  |    --remove        Remove a provider cleanly     |
+  |    --rotate-device Also rotate device identity   |
+  |                                                  |
+  |  keys.txt format:                                |
+  |    AIzaSy...                                     |
+  |    AIzaSy... # bucket=projA                      |
+  |    AIzaSy... # bucket=projB                      |
+  |                                                  |
+  |  Bucket tags group keys by Google project for    |
+  |  project-level cooldown rotation.                |
+  |                                                  |
+  +==================================================+
 """)
 
 
-# ═══════════════════════════════════════════════════════════════════
+# ===================================================================
 #  MAIN
-# ═══════════════════════════════════════════════════════════════════
+# ===================================================================
 
 def main():
-    # Handle CLI flags
     args = sys.argv[1:]
 
     if "--help" in args or "-h" in args:
@@ -884,7 +982,6 @@ def main():
             return
         pk = args[idx + 1].lower()
         if pk not in PROVIDERS:
-            # Check if it's a partial match
             matches = [k for k in PROVIDERS if pk in k]
             if len(matches) == 1:
                 pk = matches[0]
@@ -897,15 +994,15 @@ def main():
             remove_provider(pk)
         return
 
-    # ── Interactive setup ──
-    print("\n  ╔══════════════════════════════════════════════════╗")
-    print("  ║  OpenClaw Key Manager v3.2                       ║")
-    print("  ║  Keys • Models • Device Identity                 ║")
-    print("  ╚══════════════════════════════════════════════════╝")
+    rotate_device = "--rotate-device" in args
 
-    # Pre-flight
+    # -- Interactive setup --
+    print("\n  +==================================================+")
+    print("  |  OpenClaw Key Manager v4.0                       |")
+    print("  |  Keys * Models * Bucket Rotation                 |")
+    print("  +==================================================+")
+
     preflight()
-
     show_providers()
     pkeys = list(PROVIDERS.keys())
 
@@ -936,20 +1033,24 @@ def main():
 
     show_models(pk)
 
-    # Read keys
-    keys = read_keys()
-    print(f"\n  Found {len(keys)} key(s) in {KEYS_FILE}")
+    # Read keys (now returns structured entries with bucket)
+    key_entries = read_keys()
+    keys_only = [e["key"] for e in key_entries]
+    buckets = set(e["bucket"] for e in key_entries)
+    print(f"\n  Found {len(key_entries)} key(s) in {KEYS_FILE}")
+    if len(buckets) > 1 or list(buckets) != ["default"]:
+        print(f"  Buckets: {', '.join(sorted(buckets))}")
 
     # Validate key prefixes
     p = PROVIDERS[pk]
     if p["prefix"]:
-        bad = [k for k in keys if not k.startswith(p["prefix"])]
+        bad = [e for e in key_entries if not e["key"].startswith(p["prefix"])]
         if bad:
-            print(f"\n  ⚠  {len(bad)} key(s) don't start with '{p['prefix']}'")
+            print(f"\n  [!!] {len(bad)} key(s) don't start with '{p['prefix']}'")
             for b in bad[:3]:
-                print(f"     → {b[:20]}...")
+                print(f"     -> {b['key'][:20]}...")
             if len(bad) > 3:
-                print(f"     ... and {len(bad)-3} more")
+                print(f"     ... and {len(bad) - 3} more")
             try:
                 ans = input("  Continue anyway? (y/n): ").strip().lower()
             except (KeyboardInterrupt, EOFError):
@@ -958,20 +1059,25 @@ def main():
             if ans != 'y':
                 return
 
-    # Confirm
-    print(f"\n  {'═'*50}")
+    print(f"\n  {'=' * 50}")
     print(f"  Setting up: {p['name']}")
-    print(f"  Keys: {len(keys)} • Models: {len(p['models'])}")
-    print(f"  {'═'*50}")
+    print(f"  Keys: {len(key_entries)} * Models: {len(p['models'])} * Buckets: {len(buckets)}")
+    if rotate_device:
+        print(f"  Device rotation: YES")
+    print(f"  {'=' * 50}")
 
-    # Run the five steps
-    aliases = step_auth_profiles(pk, keys)
-    step_auth_json(pk, keys[0])
+    # Run setup steps
+    aliases = step_auth_profiles(pk, key_entries)
+    if not aliases:
+        return
+    step_auth_json(pk, keys_only[0])
     step_models_json(pk)
-    step_openclaw_json(pk, keys[0])
-    step_device()
+    step_openclaw_json(pk, keys_only[0])
 
-    show_done(pk, keys, aliases)
+    if rotate_device:
+        step_device()
+
+    show_done(pk, key_entries, aliases, device_rotated=rotate_device)
 
     # Restart gateway
     print("\n  Restarting gateway...")
@@ -981,21 +1087,21 @@ def main():
             capture_output=True, text=True, timeout=30
         )
         if r.returncode == 0:
-            print("  ✅ Gateway restarted")
+            print("  [OK] Gateway restarted")
         else:
-            print(f"  ⚠  Gateway returned code {r.returncode}")
+            print(f"  [!!] Gateway returned code {r.returncode}")
             if r.stderr:
-                print(f"     {r.stderr.strip()[:100]}")
-            print("  → Try manually: openclaw gateway restart")
+                print(f"       {r.stderr.strip()[:100]}")
+            print("  -> Try manually: openclaw gateway restart")
     except FileNotFoundError:
-        print("  ⚠  'openclaw' not found in PATH")
-        print("  → Restart manually: openclaw gateway restart")
+        print("  [!!] 'openclaw' not found in PATH")
+        print("  -> Restart manually: openclaw gateway restart")
     except subprocess.TimeoutExpired:
-        print("  ⚠  Gateway restart timed out (30s)")
-        print("  → Try manually: openclaw gateway restart")
+        print("  [!!] Gateway restart timed out (30s)")
+        print("  -> Try manually: openclaw gateway restart")
     except Exception as e:
-        print(f"  ⚠  {e}")
-        print("  → Try manually: openclaw gateway restart")
+        print(f"  [!!] {e}")
+        print("  -> Try manually: openclaw gateway restart")
 
     print()
 
