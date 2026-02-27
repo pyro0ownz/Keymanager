@@ -384,6 +384,51 @@ Run the tester first to verify your keys, then feed the good ones to the key man
 python3 openclaw_key_manage.py
 ```
 
+# OpenClaw Key Rotator v2.0 (The Watcher) rotateWatch.py
+
+An active, auto-rotating API key management daemon for OpenClaw. Unlike passive libraries, this version includes a real-time **Log Watcher** that monitors OpenClaw's output and swaps keys the millisecond a rate limit (`429`) or suspension (`403`) is detected.
+
+## 🛠 Why v2.0?
+* **The Problem with v1.0:** It was a "Passive Library." It contained the methods to rotate, but OpenClaw never called them. When a key hit a limit, the gateway would hang on "Compacting..." while infinitely retrying a dead key.
+* **The v2.0 Solution:** An "Active Watcher." It tails your OpenClaw logs. When it detects `RESOURCE_EXHAUSTED` or `PERMISSION_DENIED`, it immediately updates `auth.json` and `openclaw.json` with a fresh key from your pool.
+
+## 🚀 Installation & Setup
+
+1.  **Deploy the Script:**
+    Place `key_rotator.py` in your OpenClaw home directory (usually `~/.openclaw/`).
+
+2.  **Initialize your Key Pool:**
+    Ensure your `auth-profiles.json` is populated with your Google/NVIDIA/Groq keys.
+
+3.  **Launch the Watcher (The "Auto-Immune" Mode):**
+    Run this alongside your OpenClaw gateway:
+    ```bash
+    openclaw gateway logs -f | python3 key_rotator.py watch &
+    ```
+    *This pipes live logs into the rotator. It will now handle all 429 errors in the background.*
+
+## 📈 Key Features
+* **Real-Time Pipe Monitoring:** Uses `stdin` piping to catch errors as they happen.
+* **Smart Cooldowns:** Implements a 65-second "sin bin" for rate-limited keys (matching Google's 60s reset).
+* **Dead Key Detection:** Automatically flags suspended or invalid keys (Error 403) and removes them from the rotation pool.
+* **Pure ASCII Output:** Zero-dependency, terminal-friendly output for high-performance/low-resource environments.
+* **Dual-Config Updates:** Simultaneously updates the active workspace `auth.json` and the global `openclaw.json` environment variables.
+
+## 🕹 CLI Commands
+
+| Command | Description |
+| :--- | :--- |
+| `python3 key_rotator.py status` | View health, error counts, and cooldown status of all keys. |
+| `python3 key_rotator.py test` | Performs a live "ping" test on the active key to verify connectivity. |
+| `python3 key_rotator.py rotate` | Force an immediate swap to the next healthiest key in the pool. |
+| `python3 key_rotator.py reset` | Clear all error counts and cooldowns for a fresh start. |
+
+## ⚠️ Operational Note: Operation ALCHEMY
+During high-stakes monitoring (e.g., tracking terminal activity or credential escalations), keep the `watch` command running in a background screen or tmux session. If the gateway hangs on "Compacting," the watcher will detect the log-jam and force a key swap to break the database deadlock.
+
+---
+*Note: This tool is designed to work with OpenClaw 2026 and Google Gemini API rate-limiting patterns.*
+
 ## License
 
 MIT
