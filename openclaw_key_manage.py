@@ -27,7 +27,6 @@ Changelog v4.0 (from Krill review + upstream PR prep):
 """
 
 import json, os, sys, shutil, subprocess, hashlib, secrets, time, fcntl, tempfile
-import random
 from datetime import datetime
 from pathlib import Path
 
@@ -942,6 +941,7 @@ def show_help():
   |    --fix           Repair broken v3.x configs    |
   |    --remove        Remove a provider cleanly     |
   |    --rotate-device Also rotate device identity   |
+  |    --no-restart    Skip gateway restart           |
   |                                                  |
   |  keys.txt format:                                |
   |    AIzaSy...                                     |
@@ -995,6 +995,7 @@ def main():
         return
 
     rotate_device = "--rotate-device" in args
+    no_restart = "--no-restart" in args
 
     # -- Interactive setup --
     print("\n  +==================================================+")
@@ -1079,29 +1080,33 @@ def main():
 
     show_done(pk, key_entries, aliases, device_rotated=rotate_device)
 
-    # Restart gateway
-    print("\n  Restarting gateway...")
-    try:
-        r = subprocess.run(
-            ["openclaw", "gateway", "restart"],
-            capture_output=True, text=True, timeout=30
-        )
-        if r.returncode == 0:
-            print("  [OK] Gateway restarted")
-        else:
-            print(f"  [!!] Gateway returned code {r.returncode}")
-            if r.stderr:
-                print(f"       {r.stderr.strip()[:100]}")
+    # Restart gateway (unless --no-restart)
+    if no_restart:
+        print("\n  Skipping gateway restart (--no-restart)")
+        print("  -> Restart manually when ready: openclaw gateway restart")
+    else:
+        print("\n  Restarting gateway...")
+        try:
+            r = subprocess.run(
+                ["openclaw", "gateway", "restart"],
+                capture_output=True, text=True, timeout=30
+            )
+            if r.returncode == 0:
+                print("  [OK] Gateway restarted")
+            else:
+                print(f"  [!!] Gateway returned code {r.returncode}")
+                if r.stderr:
+                    print(f"       {r.stderr.strip()[:100]}")
+                print("  -> Try manually: openclaw gateway restart")
+        except FileNotFoundError:
+            print("  [!!] 'openclaw' not found in PATH")
+            print("  -> Restart manually: openclaw gateway restart")
+        except subprocess.TimeoutExpired:
+            print("  [!!] Gateway restart timed out (30s)")
             print("  -> Try manually: openclaw gateway restart")
-    except FileNotFoundError:
-        print("  [!!] 'openclaw' not found in PATH")
-        print("  -> Restart manually: openclaw gateway restart")
-    except subprocess.TimeoutExpired:
-        print("  [!!] Gateway restart timed out (30s)")
-        print("  -> Try manually: openclaw gateway restart")
-    except Exception as e:
-        print(f"  [!!] {e}")
-        print("  -> Try manually: openclaw gateway restart")
+        except Exception as e:
+            print(f"  [!!] {e}")
+            print("  -> Try manually: openclaw gateway restart")
 
     print()
 
