@@ -423,8 +423,8 @@ An active, auto-rotating API key management daemon for OpenClaw. Unlike passive 
 | `python3 key_rotator.py rotate` | Force an immediate swap to the next healthiest key in the pool. |
 | `python3 key_rotator.py reset` | Clear all error counts and cooldowns for a fresh start. |
 
-## ⚠️ Operational Note: Operation ALCHEMY
-During high-stakes monitoring (e.g., tracking terminal activity or credential escalations), keep the `watch` command running in a background screen or tmux session. If the gateway hangs on "Compacting," the watcher will detect the log-jam and force a key swap to break the database deadlock.
+## ⚠️ Operational Note: Operation I am alive!
+During high-stakes monitoring keep the `watch` command running in a background screen or tmux session. If the gateway hangs on "Compacting," the watcher will detect the log-jam and force a key swap to break the database deadlock.
 
 ---
 *Note: This tool is designed to work with OpenClaw 2026 and Google Gemini API rate-limiting patterns.*
