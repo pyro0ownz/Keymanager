@@ -27,8 +27,23 @@ Changelog v4.0 (from Krill review + upstream PR prep):
 """
 
 import json, os, sys, shutil, subprocess, hashlib, secrets, time, fcntl, tempfile
+from contextlib import contextmanager
 from datetime import datetime
 from pathlib import Path
+
+
+@contextmanager
+def file_lock(target_path):
+    """Cross-process lock for a config file.
+    Locks target_path + '.lock' so atomic rename doesn't break the lock."""
+    lock_path = target_path + ".lock"
+    os.makedirs(os.path.dirname(lock_path), exist_ok=True)
+    with open(lock_path, "w") as lf:
+        fcntl.flock(lf, fcntl.LOCK_EX)
+        try:
+            yield
+        finally:
+            fcntl.flock(lf, fcntl.LOCK_UN)
 
 # ===================================================================
 #  Ed25519 KEY GENERATION (multi-method fallback)
@@ -423,19 +438,14 @@ def read_keys(keys_file=None):
 
             # Parse key and optional metadata from inline comment
             bucket = "default"
-            key_part = stripped
+            key_part, sep, comment = stripped.partition("#")
+            key_part = key_part.strip()
+            comment = comment.strip()
 
-            if ' #' in stripped:
-                key_part, comment = stripped.split(' #', 1)
-                key_part = key_part.strip()
-                comment = comment.strip()
-
-                # Parse bucket=VALUE from comment
+            if sep:
                 for token in comment.split():
                     if token.startswith("bucket="):
                         bucket = token.split("=", 1)[1]
-                    elif token.startswith("provider="):
-                        pass  # reserved for future use
 
             if key_part:
                 entries.append({"key": key_part, "bucket": bucket})
@@ -674,26 +684,27 @@ def remove_provider(pk):
     print(f"\n  Removing {pk} from all configs...")
     removed = 0
 
-    ap = load_json(AUTH_PROFILES)
-    for key in list(ap.get("profiles", {}).keys()):
-        if key.startswith(f"{pk}:"):
-            del ap["profiles"][key]
-            if key in ap.get("usageStats", {}):
-                del ap["usageStats"][key]
-            removed += 1
-    ap.get("lastGood", {}).pop(pk, None)
-    # Clean bucket stats
-    for bk in list(ap.get("bucketStats", {}).keys()):
-        if bk.startswith(f"{pk}/"):
-            del ap["bucketStats"][bk]
-    if removed:
-        save_json(AUTH_PROFILES, ap)
+    with file_lock(AUTH_PROFILES):
+        ap = load_json(AUTH_PROFILES)
+        for key in list(ap.get("profiles", {}).keys()):
+            if key.startswith(f"{pk}:"):
+                del ap["profiles"][key]
+                if key in ap.get("usageStats", {}):
+                    del ap["usageStats"][key]
+                removed += 1
+        ap.get("lastGood", {}).pop(pk, None)
+        for bk in list(ap.get("bucketStats", {}).keys()):
+            if bk.startswith(f"{pk}/"):
+                del ap["bucketStats"][bk]
+        if removed:
+            save_json(AUTH_PROFILES, ap)
 
-    auth = load_json(AUTH_JSON)
-    if pk in auth:
-        del auth[pk]
-        save_json(AUTH_JSON, auth)
-        removed += 1
+    with file_lock(AUTH_JSON):
+        auth = load_json(AUTH_JSON)
+        if pk in auth:
+            del auth[pk]
+            save_json(AUTH_JSON, auth)
+            removed += 1
 
     models = load_json(MODELS_JSON)
     if pk in models.get("providers", {}):
@@ -726,87 +737,84 @@ def step_auth_profiles(pk, key_entries):
 
     key_entries: list of {"key": "...", "bucket": "..."} from read_keys()
     """
-    d = load_json(AUTH_PROFILES)
-    d.setdefault("version", 1)
-    d.setdefault("profiles", {})
-    d.setdefault("lastGood", {})
-    d.setdefault("usageStats", {})
-    d.setdefault("bucketStats", {})
+    with file_lock(AUTH_PROFILES):
+        d = load_json(AUTH_PROFILES)
+        d.setdefault("version", 1)
+        d.setdefault("profiles", {})
+        d.setdefault("lastGood", {})
+        d.setdefault("usageStats", {})
+        d.setdefault("bucketStats", {})
 
-    existing = [k for k in d["profiles"] if k.startswith(f"{pk}:")]
-    next_idx = len(existing) + 1
+        existing = [k for k in d["profiles"] if k.startswith(f"{pk}:")]
+        next_idx = len(existing) + 1
 
-    new_aliases = []
-    seen_buckets = set()
+        new_aliases = []
+        seen_buckets = set()
 
-    for entry in key_entries:
-        key = entry["key"]
-        bucket = entry["bucket"]
-        seen_buckets.add(bucket)
+        for entry in key_entries:
+            key = entry["key"]
+            bucket = entry["bucket"]
+            seen_buckets.add(bucket)
 
-        # Check for duplicate key
-        dupe = False
-        for alias, info in d["profiles"].items():
-            if info.get("key") == key:
-                # Update bucket if it changed
-                if info.get("bucket") != bucket:
-                    info["bucket"] = bucket
-                new_aliases.append(alias)
-                dupe = True
-                break
-        if dupe:
-            continue
+            dupe = False
+            for alias, info in d["profiles"].items():
+                if info.get("key") == key:
+                    if info.get("bucket") != bucket:
+                        info["bucket"] = bucket
+                    new_aliases.append(alias)
+                    dupe = True
+                    break
+            if dupe:
+                continue
 
-        # Find next non-colliding alias
-        a = f"{pk}:key{next_idx}"
-        while a in d["profiles"]:
-            next_idx += 1
             a = f"{pk}:key{next_idx}"
+            while a in d["profiles"]:
+                next_idx += 1
+                a = f"{pk}:key{next_idx}"
 
-        new_aliases.append(a)
-        d["profiles"][a] = {
-            "type": "api_key",
-            "provider": pk,
-            "key": key,
-            "bucket": bucket,
-        }
-        d["usageStats"].setdefault(a, {
-            "lastUsed": 0, "errorCount": 0, "lastFailureAt": 0
-        })
-        next_idx += 1
+            new_aliases.append(a)
+            d["profiles"][a] = {
+                "type": "api_key",
+                "provider": pk,
+                "key": key,
+                "bucket": bucket,
+            }
+            d["usageStats"].setdefault(a, {
+                "lastUsed": 0, "errorCount": 0, "lastFailureAt": 0
+            })
+            next_idx += 1
 
-    # Initialize bucket stats for any new buckets
-    for bucket in seen_buckets:
-        bucket_key = f"{pk}/{bucket}"
-        d["bucketStats"].setdefault(bucket_key, {
-            "cooldownUntilMs": 0, "consecutive429": 0, "last429AtMs": 0
-        })
+        for bucket in seen_buckets:
+            bucket_key = f"{pk}/{bucket}"
+            d["bucketStats"].setdefault(bucket_key, {
+                "cooldownUntilMs": 0, "consecutive429": 0, "last429AtMs": 0
+            })
 
-    # Combine existing + new, guard empty case (Krill bug #3)
-    all_aliases = existing + [a for a in new_aliases if a not in existing]
-    if all_aliases:
-        d["lastGood"][pk] = all_aliases[0]
-    elif new_aliases:
-        d["lastGood"][pk] = new_aliases[0]
-    else:
-        print("  [!!] No new or existing keys for this provider")
-        print("       Check keys.txt for valid entries")
-        return []
+        all_aliases = existing + [a for a in new_aliases if a not in existing]
+        if all_aliases:
+            d["lastGood"][pk] = all_aliases[0]
+        elif new_aliases:
+            d["lastGood"][pk] = new_aliases[0]
+        else:
+            print("  [!!] No new or existing keys for this provider")
+            print("       Check keys.txt for valid entries")
+            return []
 
-    added = len([a for a in new_aliases if a not in existing])
-    total = len(all_aliases)
-    buckets = len(seen_buckets)
-    print(f"\n  [1/4] auth-profiles.json - {added} new, {total} total, {buckets} bucket(s)")
-    save_json(AUTH_PROFILES, d)
-    return all_aliases
+        added = len([a for a in new_aliases if a not in existing])
+        total = len(all_aliases)
+        buckets = len(seen_buckets)
+        print(f"\n  [1/4] auth-profiles.json - {added} new, {total} total, {buckets} bucket(s)")
+        save_json(AUTH_PROFILES, d)
+        return all_aliases
 
 
 def step_auth_json(pk, key):
     """Step 2: auth.json - set active key for provider."""
-    d = load_json(AUTH_JSON)
-    d[pk] = {"type": "api_key", "key": key}
-    print(f"\n  [2/4] auth.json - active: ...{key[-8:]}")
-    save_json(AUTH_JSON, d)
+    with file_lock(AUTH_JSON):
+        d = load_json(AUTH_JSON)
+        d[pk] = {"type": "api_key", "key": key}
+        print(f"\n  [2/4] auth.json - active: ...{key[-8:]}")
+        save_json(AUTH_JSON, d)
 
 
 def step_models_json(pk):
