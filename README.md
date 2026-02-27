@@ -1,4 +1,4 @@
-# 🦞 OpenClaw Key Manager v3.2
+# 🦞 OpenClaw Key Manager v4.0
 
 Multi-provider API key rotation and device identity management for [OpenClaw](https://github.com/nichochar/openclaw) (2026.2.24+).
 
@@ -7,26 +7,25 @@ Automates the entire setup pipeline: reads your API keys from a file, registers 
 ## What It Does
 
 ```
-keys.txt → auth-profiles.json → auth.json → models.json → openclaw.json → device.json
+keys.txt → auth-profiles.json → auth.json → models.json → openclaw.json
 ```
 
-1. **Reads `keys.txt`** — one API key per line, supports comments with `#`
-2. **Builds key pool** — creates numbered auth profiles with usage tracking in `auth-profiles.json`
+1. **Reads `keys.txt`** — one API key per line, supports comments with `#` and `bucket=` tags
+2. **Builds key pool** — creates numbered auth profiles with usage tracking and bucket metadata in `auth-profiles.json`
 3. **Sets active key** — writes the first key as the active provider key in `auth.json`
 4. **Registers models** — adds the provider and all its models (with full schema) to `models.json`
 5. **Updates main config** — injects env vars, auth profiles, model providers, and whitelists into `openclaw.json`
-6. **Rotates device identity** — generates a fresh Ed25519 keypair and device ID in `device.json` so providers can't correlate sessions across key rotations
-7. **Restarts the gateway** — applies everything automatically
+6. **Initializes bucket stats** — creates `bucketStats` entries for project-level cooldown tracking
 
-All writes are **merge operations** — existing providers and keys from previous runs are preserved.
+All writes are **atomic** (temp file + fsync + rename) with **file locking** to prevent corruption when the rotation daemon runs simultaneously.
 
 ## Quick Start
 
 ```bash
-# Put your API keys in keys.txt (one per line)
-echo "AIzaSyBSEB38...." > keys.txt
-echo "AIzaSyBR0Kz7...." >> keys.txt
-echo "AIzaSyBaHQ6w...." >> keys.txt
+# Put your API keys in keys.txt (one per line, with optional bucket tags)
+echo "AIzaSyBSEB38.... # bucket=projA" > keys.txt
+echo "AIzaSyBR0Kz7.... # bucket=projA" >> keys.txt
+echo "AIzaSyBaHQ6w.... # bucket=projB" >> keys.txt
 
 # Run it
 python3 openclaw_key_manage.py
@@ -37,11 +36,57 @@ python3 openclaw_key_manage.py
 ## Commands
 
 ```bash
-python3 openclaw_key_manage.py                # Interactive provider setup
-python3 openclaw_key_manage.py --status        # Show all keys and providers
-python3 openclaw_key_manage.py --fix           # Repair broken configs (v3.0 → v3.2)
-python3 openclaw_key_manage.py --remove google # Remove a provider cleanly
-python3 openclaw_key_manage.py --help          # Usage info
+python3 openclaw_key_manage.py                  # Interactive provider setup
+python3 openclaw_key_manage.py --status          # Show all keys, buckets, cooldowns
+python3 openclaw_key_manage.py --fix             # Repair broken configs (v3.x → v4.0)
+python3 openclaw_key_manage.py --remove google   # Remove a provider cleanly
+python3 openclaw_key_manage.py --rotate-device   # Setup + rotate device identity
+python3 openclaw_key_manage.py --help            # Usage info
+```
+
+## Bucket Support (Google Projects)
+
+Gemini API quota is enforced at the **project level**, not per key. Multiple keys in the same Google project share the same quota. Bucket tags let the rotation daemon cool down an entire project when it hits 429, and switch to a key from a different project.
+
+### keys.txt Format
+
+```
+# Project A keys (same Google Cloud project)
+AIzaSyBSEB38.... # bucket=projA
+AIzaSyBR0Kz7.... # bucket=projA
+
+# Project B keys (different project = different quota)
+AIzaSyBaHQ6w.... # bucket=projB
+
+# Project C
+AIzaSyDk9m12.... # bucket=projC
+AIzaSyX7Pq4f.... # bucket=projC
+
+# No tag = bucket "default"
+AIzaSy0000000...
+```
+
+### How Buckets Work
+
+1. Key Manager stores `bucket` on each profile in `auth-profiles.json`
+2. Key Manager creates `bucketStats` entries per `provider/bucket`
+3. Rotation daemon reads bucket metadata and does **project-level cooldown**
+4. On 429: daemon cools down the bucket, picks a key from a **different** bucket
+5. Exponential backoff: `min(600s, 15s * 2^streak) + jitter`
+
+### auth-profiles.json (what the manager creates)
+
+```json
+{
+  "profiles": {
+    "google:key1": { "provider": "google", "key": "AIzaSy...", "bucket": "projA" },
+    "google:key2": { "provider": "google", "key": "AIzaSy...", "bucket": "projB" }
+  },
+  "bucketStats": {
+    "google/projA": { "cooldownUntilMs": 0, "consecutive429": 0, "last429AtMs": 0 },
+    "google/projB": { "cooldownUntilMs": 0, "consecutive429": 0, "last429AtMs": 0 }
+  }
+}
 ```
 
 ## Multi-Provider Stacking
@@ -49,16 +94,13 @@ python3 openclaw_key_manage.py --help          # Usage info
 Run it once per provider. Keys merge, nothing gets overwritten.
 
 ```bash
-# Google — 18 keys
-cat google_keys.txt > keys.txt
+# Google — 17 keys across 3 projects
 python3 openclaw_key_manage.py   # select 1
 
 # NVIDIA NIM — 1 key
-cat nvidia_keys.txt > keys.txt
 python3 openclaw_key_manage.py   # select 3
 
 # Groq — 5 keys
-cat groq_keys.txt > keys.txt
 python3 openclaw_key_manage.py   # select 2
 ```
 
@@ -85,76 +127,33 @@ After setup, switch models in the OpenClaw chat:
 | 9 | DeepSeek | 💰 $0.14/M input | 2 | [platform.deepseek.com](https://platform.deepseek.com) |
 | 10 | Hyperbolic | 🟢 $10 credit | 2 | [app.hyperbolic.xyz](https://app.hyperbolic.xyz) |
 
-## Files Modified
-
-| File | Location | Purpose |
-|------|----------|---------|
-| `auth-profiles.json` | `~/.openclaw/agents/main/agent/` | Key pool with `lastGood` and `usageStats` per key |
-| `auth.json` | `~/.openclaw/agents/main/agent/` | Active key per provider |
-| `models.json` | `~/.openclaw/agents/main/agent/` | Provider definitions with full model schema (`reasoning`, `input`, `cost`, `contextWindow`, `maxTokens`) |
-| `openclaw.json` | `~/.openclaw/` | Env vars, auth profiles, model providers with `${ENV_VAR}` references, and the model whitelist under `agents.defaults.models` |
-| `device.json` | `~/.openclaw/` | Ed25519 device identity (rotated each run) |
-
-Every file is backed up with a timestamp before writing (e.g., `auth-profiles.json.bak.20260227_143052`).
-
 ## Native vs OpenAI-Compatible Providers
 
 Google is handled as a **native provider** in OpenClaw. The key manager configures it through `env`, `auth.profiles`, and the model whitelist only — it does **not** inject Google into `models.providers`. OpenClaw manages the Google API connection internally.
 
 All other providers (Groq, NVIDIA NIM, OpenRouter, etc.) are configured as **OpenAI-compatible** through `models.providers` with `"api": "openai-completions"` and their respective `baseUrl`.
 
-> **If you're upgrading from v3.0:** Run `python3 openclaw_key_manage.py --fix` to remove the invalid Google provider entry that was breaking `openclaw.json` validation.
+> **If you're upgrading from v3.x:** Run `python3 openclaw_key_manage.py --fix` to remove the invalid Google provider entry.
 
-## Config Repair (`--fix`)
+## Files Modified
 
-If your config was broken by v3.0 (the `"api": "google"` bug), run:
+| File | Location | Purpose |
+|------|----------|---------|
+| `auth-profiles.json` | `~/.openclaw/agents/main/agent/` | Key pool with bucket tags, `usageStats`, and `bucketStats` |
+| `auth.json` | `~/.openclaw/agents/main/agent/` | Active key per provider |
+| `models.json` | `~/.openclaw/agents/main/agent/` | Provider definitions with full model schema |
+| `openclaw.json` | `~/.openclaw/` | Env vars, auth profiles, model providers, whitelist |
+| `device.json` | `~/.openclaw/` | Ed25519 device identity (**opt-in only** with `--rotate-device`) |
 
-```bash
-python3 openclaw_key_manage.py --fix
-openclaw gateway restart
-```
-
-This removes the invalid Google entry from `models.providers` and cleans up any empty `baseUrl` fields. Your other providers (nvidia-nim, groq, etc.) are left untouched.
-
-## Key Pool Status (`--status`)
-
-Check the health of all configured keys:
-
-```bash
-python3 openclaw_key_manage.py --status
-```
-
-Shows per-key error counts, cooldown status, active key markers, and model counts per provider.
-
-## Provider Removal (`--remove`)
-
-Cleanly strip a provider from all five config files:
-
-```bash
-python3 openclaw_key_manage.py --remove groq
-```
-
-Removes the provider's keys from `auth-profiles.json`, `auth.json`, `models.json`, `openclaw.json` (env, auth, models, whitelist), and confirms before writing.
+Every file is written atomically (temp + fsync + rename) with `fcntl` file locking.
 
 ## Device Identity Rotation
 
-Each run generates a new `device.json` with:
+Device rotation is **opt-in** (v3.x rotated every run, causing pairing churn). Use `--rotate-device` when you specifically want to reset OpenClaw's identity.
 
-- Fresh SHA-256 device ID from 64 bytes of cryptographic randomness
-- New Ed25519 keypair (PEM-encoded PKCS8 format)
-- Updated `createdAtMs` timestamp
-
-This prevents API providers from correlating your sessions across key rotations. The script tries three methods for Ed25519 generation in order:
-
-1. Python `cryptography` library
-2. `openssl` CLI
-3. `PyNaCl`
-
-At least one of these is available on any standard Linux install.
+Device rotation does NOT increase provider quota — Google rate-limits by project/key/IP, not by OpenClaw device identity.
 
 ## Key Prefix Validation
-
-The script validates key prefixes before writing:
 
 | Provider | Expected Prefix |
 |----------|----------------|
@@ -164,64 +163,46 @@ The script validates key prefixes before writing:
 | OpenRouter | `sk-or-` |
 | Cerebras | `csk-` |
 
-Mismatched prefixes trigger a warning with the option to continue or abort.
-
 ## Requirements
 
 - Python 3.8+
 - OpenClaw 2026.2.24+
-- One of: `cryptography`, `openssl`, or `PyNaCl` (for Ed25519 device rotation)
-
-```bash
-# If you need cryptography:
-pip install cryptography --break-system-packages
-```
-
-## keys.txt Format
-
-```
-# Google Gemini keys
-AIzaSyBS....
-AIzaSyBR.....
-
-# Blank lines and comments are ignored
-AIzaSyB....
-```
+- One of: `cryptography`, `openssl`, or `PyNaCl` (for Ed25519, only with `--rotate-device`)
 
 ## Changelog
 
+### v4.0
+- **ADDED:** Bucket/project support in keys.txt (`# bucket=projA`)
+- **ADDED:** `bucketStats` in auth-profiles.json for project-level cooldown
+- **ADDED:** Atomic writes (temp file + fsync + rename) to prevent file corruption
+- **ADDED:** File locking (`fcntl`) to prevent race conditions with rotation daemon
+- **CHANGED:** Device rotation is now **opt-in** via `--rotate-device` (no longer runs every setup)
+- **CHANGED:** `--status` counts models from whitelist (authoritative), not models.json
+- **CHANGED:** Steps now 4 by default (was 5), device rotation is optional 5th
+- **FIXED:** Duplicate-keys-only crash in `step_auth_profiles()` (empty alias guard)
+- **FIXED:** `read_keys()` returns structured entries with bucket metadata
+
 ### v3.2
-- **FIXED:** Google handled as native provider — no longer injected into `models.providers` (was causing `"api": "google"` validation error that broke OpenClaw configs)
-- **FIXED:** `baseUrl: undefined` no longer written for providers without a base URL
-- **FIXED:** Unicode/emoji encoding crash on terminals with restricted locale — pure ASCII output
-- **ADDED:** `--fix` command to repair broken v3.0 configs automatically
-- **ADDED:** `--status` command to show all keys, error counts, cooldowns, and active key per provider
-- **ADDED:** `--remove` command to cleanly strip a provider from all config files
-- **ADDED:** `--help` command
-- **ADDED:** Pre-flight checks — verifies OpenClaw installation before writing any files
-- **ADDED:** Duplicate key detection — re-running doesn't create duplicate pool entries
-- **IMPROVED:** Backup filenames now use ISO timestamps instead of unix epoch
-- **IMPROVED:** Key file parser handles inline comments and whitespace
-- **IMPROVED:** Error handling on file operations, keyboard interrupts, missing OpenClaw
+- Google handled as native provider — no `models.providers` injection
+- `--fix`, `--status`, `--remove` commands added
+- Pure ASCII output for restricted terminals
 
 ### v3.0
-- Initial multi-provider release with 10 providers and device identity rotation
-- **Known issue:** Google provider injection into `models.providers` with `"api": "google"` breaks OpenClaw config validation. Upgrade to v3.2 and run `--fix`.
+- Initial multi-provider release
+- **Known issue:** Google `"api": "google"` broke config validation
 
 ## Contributing
-
-Add new providers by extending the `PROVIDERS` dictionary. Each entry needs:
 
 ```python
 "provider-name": {
     "name": "Display Name",
     "api": "openai-completions",
-    "url": "https://api.example.com/v1",  # None for native providers
-    "prefix": "sk-",  # key prefix for validation, "" to skip
+    "url": "https://api.example.com/v1",
+    "prefix": "sk-",
     "free": True,
-    "native": False,  # True only for providers OpenClaw handles internally (Google)
+    "native": False,
     "info": "Rate limits | signup URL",
-    "env": "PROVIDER_API_KEY",  # env var name in openclaw.json
+    "env": "PROVIDER_API_KEY",
     "models": [
         {"id": "model-id", "name": "Display Name", "cw": 128000, "mt": 8192, "r": False},
     ]
@@ -384,52 +365,142 @@ Run the tester first to verify your keys, then feed the good ones to the key man
 python3 openclaw_key_manage.py
 ```
 
-# OpenClaw Key Rotator v2.0 (The Watcher) rotateWatch.py
+🦐 OpenClaw Key Rotation Daemon v3.0
+Bucket-aware API key rotation with exponential backoff for OpenClaw (2026.2.24+).
+Watches for rate limit errors and automatically switches to a key from a different Google project (bucket). Cools down the entire project on 429, not just one key. Only writes auth.json — confirmed to take effect without gateway restart.
+Quick Start
+bash# Start the daemon in pipe mode (fastest)
+openclaw logs --follow | python3 key_rotator.py watch
 
-An active, auto-rotating API key management daemon for OpenClaw. Unlike passive libraries, this version includes a real-time **Log Watcher** that monitors OpenClaw's output and swaps keys the millisecond a rate limit (`429`) or suspension (`403`) is detected.
+# Or let it auto-detect log locations
+python3 key_rotator.py watch
+Commands
+bashpython3 key_rotator.py              # Show status (default)
+python3 key_rotator.py status       # Show all keys + bucket cooldowns
+python3 key_rotator.py rotate       # Force rotate to next bucket/key
+python3 key_rotator.py reset        # Reset all cooldowns and error counts
+python3 key_rotator.py test         # Test active key + auto-rotate if bad
+python3 key_rotator.py health       # Quick health ping (no rotation)
+python3 key_rotator.py watch        # Start auto-rotation daemon
+How It Works
+Error Classification
+Error TypeSignalActionRate limit429, RESOURCE_EXHAUSTED, API rate limit reachedCool down bucket, rotate to different bucketDead keyAPI_KEY_INVALID, PERMISSION_DENIEDMark key dead (100 errors), rotate, requires manual fixTransient500, 502, 503, UNAVAILABLELog and monitor, no rotation
+Bucket-Level Cooldown
+Gemini quota is enforced per Google project, not per API key. Multiple keys in the same project share the same quota bucket.
+When a 429 is detected:
 
-## 🛠 Why v2.0?
-* **The Problem with v1.0:** It was a "Passive Library." It contained the methods to rotate, but OpenClaw never called them. When a key hit a limit, the gateway would hang on "Compacting..." while infinitely retrying a dead key.
-* **The v2.0 Solution:** An "Active Watcher." It tails your OpenClaw logs. When it detects `RESOURCE_EXHAUSTED` or `PERMISSION_DENIED`, it immediately updates `auth.json` and `openclaw.json` with a fresh key from your pool.
+The entire bucket (Google project) goes into cooldown, not just the key
+The daemon picks a key from a different bucket
+Backoff is exponential: min(600s, 15s * 2^streak) + jitter
+On success, the bucket's streak resets to 0
 
-## 🚀 Installation & Setup
+On 429:
+  bucket "projA" → cooldown 15s   (streak 1)
+  next 429:      → cooldown 30s   (streak 2)
+  next 429:      → cooldown 60s   (streak 3)
+  next 429:      → cooldown 120s  (streak 4)
+  ...capped at:  → cooldown 600s  (streak N)
 
-1.  **Deploy the Script:**
-    Place `rotateWatcher.py` in your OpenClaw home directory (usually `~/.openclaw/workspace`).
+On success:
+  bucket "projA" → streak reset to 0, cooldown cleared
+Key Selection Algorithm
+1. Skip keys whose bucket is in cooldown (cooldownUntilMs > now)
+2. Skip dead keys (errorCount >= 100)
+3. Pick least-recently-used among remaining keys
+4. If ALL buckets cooling: pick the one expiring soonest, report wait time
+What Gets Written
+Only auth.json is updated on rotation. Confirmed: OpenClaw picks up the new key immediately without restarting the gateway.
+The daemon does NOT touch:
 
-2.  **Initialize your Key Pool:**
-    Ensure your `auth-profiles.json` is populated with your Google/NVIDIA/Groq keys.
+openclaw.json (env vars stay as-is)
+device.json (no identity rotation)
+models.json (no model changes)
 
-3.  **Launch the Watcher (The "Auto-Immune" Mode):**
-    Run this alongside your OpenClaw gateway:
-    ```bash
-    openclaw gateway logs -f | python3 rotateWatcher.py watch &
-    ```
-    *This pipes live logs into the rotator. It will now handle all 429 errors in the background.*
+All writes are atomic (temp file + fsync + rename) with file locking to prevent corruption.
+Watch Modes
+Pipe Mode (fastest reaction)
+bashopenclaw logs --follow | python3 key_rotator.py watch
+Reads OpenClaw's log output line-by-line in real time. The moment it sees a rate limit pattern, it rotates.
+Auto-Detect Mode
+bashpython3 key_rotator.py watch
+Checks these locations in order:
 
-## 📈 Key Features
-* **Real-Time Pipe Monitoring:** Uses `stdin` piping to catch errors as they happen.
-* **Smart Cooldowns:** Implements a 65-second "sin bin" for rate-limited keys (matching Google's 60s reset).
-* **Dead Key Detection:** Automatically flags suspended or invalid keys (Error 403) and removes them from the rotation pool.
-* **Pure ASCII Output:** Zero-dependency, terminal-friendly output for high-performance/low-resource environments.
-* **Dual-Config Updates:** Simultaneously updates the active workspace `auth.json` and the global `openclaw.json` environment variables.
+/tmp/openclaw/openclaw-YYYY-MM-DD.log (OpenClaw default log file)
+~/.openclaw/logs/gateway.log (legacy location)
+openclaw logs --follow subprocess
+Polling mode (fallback — pings active key every 30s)
 
-## 🕹 CLI Commands
+Polling Mode (fallback)
+If no logs are accessible, the daemon tests the active key every 30 seconds with a minimal generateContent request (1 token). On 429, it rotates. On success, it clears the bucket cooldown.
+Status Output
+bash$ python3 key_rotator.py status
 
-| Command | Description |
-| :--- | :--- |
-| `python3 rotateWatcher.py status` | View health, error counts, and cooldown status of all keys.            |
-| `python3 rotateWatcher.py test`   | Performs a live "ping" test on the active key to verify connectivity.  |
-| `python3 rotateWatcher.py rotate` | Force an immediate swap to the next healthiest key in the pool.        |
-| `python3 rotateWatcher.py reset`  | Clear all error counts and cooldowns for a fresh start.                |
-| `python3 rotateWatcher.py watch ` | - Start auto-rotation daemon.                                          |
+  -- google (5 keys) --
+    BUCKET [projA]: COOLING 42s (streak: 2)
+    BUCKET [projB]: [OK]
+    BUCKET [projC]: ready (last streak: 1)
+  Name                     Err   Bucket       Status
+  ------------------------------------------------------------
+  google:key1              2     projA        [--]
+  google:key2              0     projA        [OK]
+  google:key3              0     projB        [OK] < ACTIVE
+  google:key4              100   projC        [DEAD]
+  google:key5              0     projC        [OK]
 
-## ⚠️ Operational Note: Operation I am alive!
-During high-stakes monitoring keep the `watch` command running in a background screen or tmux session. If the gateway hangs on "Compacting," the watcher will detect the log-jam and force a key swap to break the database deadlock.
+  Total: 5 keys | Healthy: 3 | Buckets cooling: 1 | Dead: 1
+Pairing with Key Manager v4.0
+The Key Manager sets up the key pool with bucket metadata. The Rotator reads that metadata for runtime rotation.
+bash# Step 1: Provision keys with bucket tags
+echo "AIzaSy... # bucket=projA" > keys.txt
+echo "AIzaSy... # bucket=projB" >> keys.txt
+python3 openclaw_key_manage.py
 
----
-*Note: This tool is designed to work with OpenClaw 2026 and Google Gemini API rate-limiting patterns.*
+# Step 2: Start the daemon
+openclaw logs --follow | python3 key_rotator.py watch &
 
+# Step 3: Use OpenClaw normally — rotation is automatic
+Data Flow
+Key Manager (provisioning):
+  keys.txt → auth-profiles.json (bucket + stats) → auth.json → openclaw.json
+
+Rotator (runtime):
+  OpenClaw logs → detect 429 → read bucket from auth-profiles.json
+                             → set bucket cooldown (exponential backoff)
+                             → pick key from different bucket
+                             → write auth.json (atomic, no restart needed)
+Concurrency Note
+If you're running OpenClaw with maxConcurrent: 4 and subagents.maxConcurrent: 8, that's up to 12 parallel requests hitting the same key. At 15 RPM free tier, one burst can exhaust a key instantly.
+While testing rotation, set maxConcurrent: 1 in openclaw.json to isolate rotation behavior from concurrency-induced 429s.
+Configuration
+Edit the constants at the top of key_rotator.py:
+SettingDefaultDescriptionBACKOFF_BASE_SECONDS15First cooldown durationBACKOFF_MAX_SECONDS600Maximum cooldown (10 min cap)BACKOFF_JITTER_MAX2.0Random jitter added to cooldownsKEY_COOLDOWN_SECONDS65Per-key cooldown for non-bucket providersMIN_ROTATION_INTERVAL5Minimum seconds between rotationsPOLL_INTERVAL30Seconds between health checks in polling mode
+Requirements
+
+Python 3.8+
+OpenClaw 2026.2.24+
+Key Manager v4.0 (auth-profiles.json with bucket metadata)
+Network access to generativelanguage.googleapis.com (for test/health/polling modes)
+
+Changelog
+v3.0
+
+ADDED: Bucket-aware rotation — cools down entire Google project, not just one key
+ADDED: Exponential backoff with jitter (min(600s, 15s * 2^streak) + random)
+ADDED: Three-tier error classification: rate_limit / dead / transient
+ADDED: health command — quick ping without rotation
+ADDED: Correct log locations: /tmp/openclaw/openclaw-YYYY-MM-DD.log
+ADDED: Correct CLI tail: openclaw logs --follow (not gateway logs)
+CHANGED: Only writes auth.json on rotation (no env/restart/device changes)
+CHANGED: Atomic writes + file locking (shared I/O format with Key Manager v4.0)
+FIXED: Log watcher uses correct OpenClaw CLI and file paths
+
+v2.0
+
+Key-level cooldown, pattern matching, three watch modes
+
+v1.0
+
+Passive library — nothing called it at runtime
 ## License
 
 MIT
