@@ -72,7 +72,6 @@ RATE_LIMIT_PATTERNS = [
     "API rate limit reached",
     "rate limit",
     "quota exceeded",
-    "429",
     "Too Many Requests",
     "rateLimitExceeded",
     "RATE_LIMIT_EXCEEDED",
@@ -94,10 +93,6 @@ TRANSIENT_PATTERNS = [
     "INTERNAL",
     "UNAVAILABLE",
     "DEADLINE_EXCEEDED",
-    "500",
-    "502",
-    "503",
-    "504",
 ]
 
 
