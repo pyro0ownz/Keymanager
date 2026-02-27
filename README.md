@@ -499,4 +499,4 @@ v1.0
 Passive library (nothing called it at runtime)
 ## License
 
-MIT
+apache2.0
