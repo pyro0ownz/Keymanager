@@ -40,8 +40,38 @@ import re
 import fcntl
 import tempfile
 import random
+from contextlib import contextmanager
 from pathlib import Path
 from datetime import datetime
+
+
+@contextmanager
+def file_lock(target_path):
+    """Cross-process lock for a config file.
+    Locks target_path + '.lock' so atomic rename doesn't break the lock."""
+    lock_path = str(target_path) + ".lock"
+    os.makedirs(os.path.dirname(lock_path), exist_ok=True)
+    with open(lock_path, "w") as lf:
+        fcntl.flock(lf, fcntl.LOCK_EX)
+        try:
+            yield
+        finally:
+            fcntl.flock(lf, fcntl.LOCK_UN)
+
+
+def ts_to_ms(v):
+    """Convert a timestamp to milliseconds, handling both seconds and ms formats."""
+    if not v:
+        return 0
+    try:
+        v = float(v)
+    except Exception:
+        return 0
+    if v > 1e12:
+        return int(v)
+    if v > 1e10:
+        return int(v)
+    return int(v * 1000)
 
 # ================================================================
 #  CONFIGURATION
@@ -214,9 +244,8 @@ class KeyRotator:
             bucket_cooling = self._is_bucket_cooling(provider, bucket)
 
             last_fail = stats.get('lastFailureAt', 0)
-            key_cooling = False
-            if last_fail > 0:
-                key_cooling = (now_ms - last_fail * 1000) < (KEY_COOLDOWN_SECONDS * 1000)
+            last_fail_ms = ts_to_ms(last_fail)
+            key_cooling = last_fail_ms and ((now_ms - last_fail_ms) < (KEY_COOLDOWN_SECONDS * 1000))
 
             score = 0
             if error_count >= 100:
@@ -344,44 +373,63 @@ class KeyRotator:
         return best['name'], best['key'], best['bucket']
 
     def rotate(self, provider='google', reason="manual"):
-        """Mark current key/bucket as failed and rotate to next bucket."""
+        """Mark current key/bucket as failed and rotate to next bucket.
+        Derives the active key from auth.json (source of truth), not lastGood."""
         now = time.time()
 
         if (now - self.last_rotation_time) < MIN_ROTATION_INTERVAL:
             return None, None, None
 
-        self.load()
+        with file_lock(str(self.profiles_path)):
+            self.load()
 
-        current_name = self.data.get('lastGood', {}).get(provider)
-        current_bucket = "default"
-        if current_name and current_name in self.data.get('profiles', {}):
-            current_bucket = self.data['profiles'][current_name].get('bucket', 'default')
-            stats = self.data.setdefault('usageStats', {}).setdefault(current_name, {})
-            stats['errorCount'] = stats.get('errorCount', 0) + 1
-            stats['lastFailureAt'] = now
+            # Derive active key/bucket from auth.json (what OpenClaw is actually using)
+            auth = load_json(str(self.auth_json_path))
+            active_key = auth.get(provider, {}).get("key", "")
 
-        cd_seconds = self._set_bucket_cooldown(provider, current_bucket)
+            active_name = None
+            active_bucket = "default"
+            if active_key:
+                for n, prof in self.data.get("profiles", {}).items():
+                    if prof.get("provider") == provider and prof.get("key") == active_key:
+                        active_name = n
+                        active_bucket = prof.get("bucket", "default")
+                        break
 
-        # Save cooldown state before selecting next key
-        self.save()
+            current_name = active_name or self.data.get('lastGood', {}).get(provider)
 
-        name, key, bucket = self.get_best_key(provider, _skip_reload=True)
-        if not name or not key:
-            print(f"  XX No keys available for {provider}")
+            # Increment errors on the actual active profile
+            if current_name:
+                stats = self.data.setdefault('usageStats', {}).setdefault(current_name, {})
+                stats['errorCount'] = stats.get('errorCount', 0) + 1
+                stats['lastFailureAt'] = now
+
+            # Cool down the ACTIVE bucket (not lastGood's bucket)
+            cd_seconds = self._set_bucket_cooldown(provider, active_bucket)
+
+            # Save cooldown state before selecting next key
             self.save()
-            return None, None, None
 
-        self.data.setdefault('lastGood', {})[provider] = name
-        self.data.setdefault('usageStats', {}).setdefault(name, {})
-        self.data['usageStats'][name]['lastUsed'] = now
-        self.save()
+            name, key, bucket = self.get_best_key(provider, _skip_reload=True)
+            if not name or not key:
+                print(f"  XX No keys available for {provider}")
+                return None, None, None
 
-        self._update_auth_json(provider, key)
+            self.data.setdefault('lastGood', {})[provider] = name
+            self.data.setdefault('usageStats', {}).setdefault(name, {})
+            self.data['usageStats'][name]['lastUsed'] = now
+            self.save()
+
+        # Update auth.json under its own lock
+        with file_lock(str(self.auth_json_path)):
+            auth = load_json(str(self.auth_json_path))
+            auth[provider] = {"type": "api_key", "key": key}
+            save_json(str(self.auth_json_path), auth)
 
         self.last_rotation_time = now
         ts = datetime.now().strftime('%H:%M:%S')
-        bucket_changed = bucket != current_bucket
-        switch = f"bucket {current_bucket} -> {bucket}" if bucket_changed else "same bucket"
+        bucket_changed = bucket != active_bucket
+        switch = f"bucket {active_bucket} -> {bucket}" if bucket_changed else "same bucket"
         print(f"  [{ts}] Rotated {provider}: {current_name} -> {name} "
               f"({switch}, cooldown {int(cd_seconds)}s, reason: {reason})")
         return name, key, bucket
@@ -407,15 +455,6 @@ class KeyRotator:
             if current in self.data.get('usageStats', {}):
                 self.data['usageStats'][current]['errorCount'] = 0
             self.save()
-
-    def _update_auth_json(self, provider, key):
-        """Update auth.json with new active key (atomic write)."""
-        try:
-            auth = load_json(str(self.auth_json_path))
-            auth[provider] = {"type": "api_key", "key": key}
-            save_json(str(self.auth_json_path), auth)
-        except Exception as e:
-            print(f"  XX auth.json update failed: {e}")
 
     def reset_all(self, provider=None):
         """Reset all error counts and bucket cooldowns."""
