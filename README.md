@@ -403,7 +403,7 @@ An active, auto-rotating API key management daemon for OpenClaw. Unlike passive 
 3.  **Launch the Watcher (The "Auto-Immune" Mode):**
     Run this alongside your OpenClaw gateway:
     ```bash
-    openclaw gateway logs -f | python3 key_rotator.py watch &
+    openclaw gateway logs -f | python3 rotateWatcher.py watch &
     ```
     *This pipes live logs into the rotator. It will now handle all 429 errors in the background.*
 
@@ -418,10 +418,11 @@ An active, auto-rotating API key management daemon for OpenClaw. Unlike passive 
 
 | Command | Description |
 | :--- | :--- |
-| `python3 key_rotator.py status` | View health, error counts, and cooldown status of all keys. |
-| `python3 key_rotator.py test` | Performs a live "ping" test on the active key to verify connectivity. |
-| `python3 key_rotator.py rotate` | Force an immediate swap to the next healthiest key in the pool. |
-| `python3 key_rotator.py reset` | Clear all error counts and cooldowns for a fresh start. |
+| `python3 rotateWatcher.py status` | View health, error counts, and cooldown status of all keys.            |
+| `python3 rotateWatcher.py test`   | Performs a live "ping" test on the active key to verify connectivity.  |
+| `python3 rotateWatcher.py rotate` | Force an immediate swap to the next healthiest key in the pool.        |
+| `python3 rotateWatcher.py reset`  | Clear all error counts and cooldowns for a fresh start.                |
+| `python3 rotateWatcher.py watch ` | - Start auto-rotation daemon.                                          |
 
 ## ⚠️ Operational Note: Operation I am alive!
 During high-stakes monitoring keep the `watch` command running in a background screen or tmux session. If the gateway hangs on "Compacting," the watcher will detect the log-jam and force a key swap to break the database deadlock.
