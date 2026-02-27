@@ -395,7 +395,7 @@ An active, auto-rotating API key management daemon for OpenClaw. Unlike passive 
 ## 🚀 Installation & Setup
 
 1.  **Deploy the Script:**
-    Place `key_rotator.py` in your OpenClaw home directory (usually `~/.openclaw/`).
+    Place `key_rotator.py` in your OpenClaw home directory (usually `~/.openclaw/workspace`).
 
 2.  **Initialize your Key Pool:**
     Ensure your `auth-profiles.json` is populated with your Google/NVIDIA/Groq keys.
