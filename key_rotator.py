@@ -436,45 +436,48 @@ class KeyRotator:
 
     def mark_dead(self, provider='google', profile_name=None):
         """Mark a key as dead (100+ errors). For 401/403 responses."""
-        self.load()
-        if profile_name is None:
-            profile_name = self.data.get('lastGood', {}).get(provider)
-        if profile_name and profile_name in self.data.get('usageStats', {}):
-            self.data['usageStats'][profile_name]['errorCount'] = 100
-            self.save()
-            ts = datetime.now().strftime('%H:%M:%S')
-            print(f"  [{ts}] Marked {profile_name} as DEAD (auth error)")
+        with file_lock(str(self.profiles_path)):
+            self.load()
+            if profile_name is None:
+                profile_name = self.data.get('lastGood', {}).get(provider)
+            if profile_name and profile_name in self.data.get('usageStats', {}):
+                self.data['usageStats'][profile_name]['errorCount'] = 100
+                self.save()
+                ts = datetime.now().strftime('%H:%M:%S')
+                print(f"  [{ts}] Marked {profile_name} as DEAD (auth error)")
 
     def report_success(self, provider='google'):
         """Report successful API call. Clears bucket cooldown + resets errors."""
-        self.load()
-        current = self.data.get('lastGood', {}).get(provider)
-        if current and current in self.data.get('profiles', {}):
-            bucket = self.data['profiles'][current].get('bucket', 'default')
-            self._clear_bucket_cooldown(provider, bucket)
-            if current in self.data.get('usageStats', {}):
-                self.data['usageStats'][current]['errorCount'] = 0
-            self.save()
+        with file_lock(str(self.profiles_path)):
+            self.load()
+            current = self.data.get('lastGood', {}).get(provider)
+            if current and current in self.data.get('profiles', {}):
+                bucket = self.data['profiles'][current].get('bucket', 'default')
+                self._clear_bucket_cooldown(provider, bucket)
+                if current in self.data.get('usageStats', {}):
+                    self.data['usageStats'][current]['errorCount'] = 0
+                self.save()
 
     def reset_all(self, provider=None):
         """Reset all error counts and bucket cooldowns."""
-        self.load()
-        for name in self.data.get('usageStats', {}):
-            if provider and not name.startswith(f"{provider}:"):
-                continue
-            self.data['usageStats'][name]['errorCount'] = 0
-            self.data['usageStats'][name]['lastFailureAt'] = 0
+        with file_lock(str(self.profiles_path)):
+            self.load()
+            for name in self.data.get('usageStats', {}):
+                if provider and not name.startswith(f"{provider}:"):
+                    continue
+                self.data['usageStats'][name]['errorCount'] = 0
+                self.data['usageStats'][name]['lastFailureAt'] = 0
 
-        for bk in self.data.get('bucketStats', {}):
-            if provider and not bk.startswith(f"{provider}/"):
-                continue
-            self.data['bucketStats'][bk]['cooldownUntilMs'] = 0
-            self.data['bucketStats'][bk]['consecutive429'] = 0
-            self.data['bucketStats'][bk]['last429AtMs'] = 0
+            for bk in self.data.get('bucketStats', {}):
+                if provider and not bk.startswith(f"{provider}/"):
+                    continue
+                self.data['bucketStats'][bk]['cooldownUntilMs'] = 0
+                self.data['bucketStats'][bk]['consecutive429'] = 0
+                self.data['bucketStats'][bk]['last429AtMs'] = 0
 
-        self.save()
-        scope = provider or "all providers"
-        print(f"  OK Reset all cooldowns and errors for {scope}")
+            self.save()
+            scope = provider or "all providers"
+            print(f"  OK Reset all cooldowns and errors for {scope}")
 
     def status(self):
         """Print status table with bucket cooldown info."""
