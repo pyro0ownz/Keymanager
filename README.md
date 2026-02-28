@@ -489,9 +489,10 @@ POLL_INTERVAL 30 Health check interval in polling mode
 
 Python 3.8+
 OpenClaw 2026.2.24+
-##Key Manager v4.0 (auth-profiles.json with bucket metadata)
 
-##Changelog v3.0
+## Key Manager v4.0 (auth-profiles.json with bucket metadata)
+
+## Changelog v3.0
 
 Bucket-aware rotation (project-level cooldown)
 Exponential backoff with jitter
