@@ -471,12 +471,15 @@ keys.txt → auth-profiles.json (bucket + stats) → auth.json → openclaw.json
                → set bucket cooldown (exponential backoff)
                → pick key from different bucket
                → write auth.json only (atomic, no restart)
+```
 ##Concurrency Note
 With maxConcurrent: 4 and subagents.maxConcurrent: 8, up to 12 parallel requests can hit the same key. At 15 RPM free tier, one burst exhausts a key instantly.
 While testing rotation, set maxConcurrent: 1 in openclaw.json.
+```
+```
 ##Configuration
 SettingDefaultDescription BACKOFF_BASE_SECONDS15 First cooldown duration BACKOFF_MAX_SECONDS 600 Maximum cooldown (10 min cap) BACKOFF_JITTER_MAX2.0 Random jitter(seconds) KEY_COOLDOWN_SECONDS65 Per-key cooldown for non-bucket providers MIN_ROTATION_INTERVAL 5 Minimum seconds between rotations POLL_INTERVAL 30 Health check interval in polling mode
-
+```
 #Requirements
 
 Python 3.8+
