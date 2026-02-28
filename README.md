@@ -459,28 +459,29 @@ openclaw gateway run
 
 # 3. In second terminal, start daemon
 openclaw logs --follow | python3 key_rotator.py watch
-Data Flow
-Key Manager (provisioning, runs once per provider):
-  keys.txt → auth-profiles.json (bucket + stats) → auth.json → openclaw.json
 
-Rotator (runtime, runs continuously):
+#Data Flow
+Key Manager (provisioning, runs once per provider):
+keys.txt → auth-profiles.json (bucket + stats) → auth.json → openclaw.json
+
+#Rotator (runtime, runs continuously):
   OpenClaw logs → detect 429 → read bucket from auth-profiles.json
                → set bucket cooldown (exponential backoff)
                → pick key from different bucket
                → write auth.json only (atomic, no restart)
-Concurrency Note
+#Concurrency Note
 With maxConcurrent: 4 and subagents.maxConcurrent: 8, up to 12 parallel requests can hit the same key. At 15 RPM free tier, one burst exhausts a key instantly.
 While testing rotation, set maxConcurrent: 1 in openclaw.json.
-Configuration
-SettingDefaultDescriptionBACKOFF_BASE_SECONDS15First cooldown durationBACKOFF_MAX_SECONDS600Maximum cooldown (10 min cap)BACKOFF_JITTER_MAX2.0Random jitter (seconds)KEY_COOLDOWN_SECONDS65Per-key cooldown for non-bucket providersMIN_ROTATION_INTERVAL5Minimum seconds between rotationsPOLL_INTERVAL30Health check interval in polling mode
-Requirements
+#Configuration
+SettingDefaultDescription BACKOFF_BASE_SECONDS15 First cooldown duration BACKOFF_MAX_SECONDS600 Maximum cooldown (10 min cap) BACKOFF_JITTER_MAX2.0 Random jitter(seconds) KEY_COOLDOWN_SECONDS65 Per-key cooldown for non-bucket providers MIN_ROTATION_INTERVAL 5 Minimum seconds between rotations POLL_INTERVAL 30 Health check interval in polling mode
+
+#Requirements
 
 Python 3.8+
 OpenClaw 2026.2.24+
-Key Manager v4.0 (auth-profiles.json with bucket metadata)
+#Key Manager v4.0 (auth-profiles.json with bucket metadata)
 
-Changelog
-v3.0
+#Changelog v3.0
 
 Bucket-aware rotation (project-level cooldown)
 Exponential backoff with jitter
@@ -490,11 +491,11 @@ Only writes auth.json (no env/restart/device)
 Atomic writes, no backup file creation
 health command for lightweight ping
 
-v2.0
+#v2.0
 
 Key-level cooldown, pattern matching, three watch modes
 
-v1.0
+#v1.0
 
 Passive library (nothing called it at runtime)
 ## License
