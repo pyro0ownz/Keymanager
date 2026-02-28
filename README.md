@@ -365,7 +365,7 @@ Run the tester first to verify your keys, then feed the good ones to the key man
 python3 openclaw_key_manage.py
 ```
 
-🦐 OpenClaw Key Rotation Daemon v3.0
+##🦐 OpenClaw Key Rotation Daemon v3.0
 Bucket-aware API key rotation with exponential backoff for OpenClaw (2026.2.24+).
 Watches for rate limit errors and automatically switches to a key from a different Google project (bucket). Cools down the entire project on 429, not just one key. Only writes auth.json — confirmed to take effect without gateway restart.
 Quick Start
@@ -433,9 +433,10 @@ Polling mode (fallback)
 Polling Mode (fallback)
 Tests active key every 30s with a minimal generateContent request (1 token). On 429, rotates. On success, clears cooldown.
 Status Output
-$ python3 key_rotator.py status
+##$ python3 key_rotator.py status
 
-  -- google (5 keys) --
+ ##-- google (5 keys) --
+ ```
     BUCKET [projA]: COOLING 42s (streak: 2)
     BUCKET [projB]: [OK]
     BUCKET [projC]: ready (last streak: 1)
@@ -448,40 +449,41 @@ $ python3 key_rotator.py status
   google:key5              0     projC        [OK]
 
   Total: 5 keys | Healthy: 3 | Buckets cooling: 1 | Dead: 1
-Pairing with Key Manager v4.0
+```
+##Pairing with Key Manager v4.0
 bash# 1. Provision keys with bucket tags
 echo "AIzaSy... # bucket=projA" > keys.txt
 echo "AIzaSy... # bucket=projB" >> keys.txt
-python3 openclaw_key_manage.py --no-restart
+python3 openclaw_key_manage.py --no-restart 
 
-# 2. Start gateway foreground
+## 2. Start gateway foreground
 openclaw gateway run
 
-# 3. In second terminal, start daemon
+## 3. In second terminal, start daemon
 openclaw logs --follow | python3 key_rotator.py watch
 
-#Data Flow
+##Data Flow
 Key Manager (provisioning, runs once per provider):
 keys.txt → auth-profiles.json (bucket + stats) → auth.json → openclaw.json
 
-#Rotator (runtime, runs continuously):
+##Rotator (runtime, runs continuously):
   OpenClaw logs → detect 429 → read bucket from auth-profiles.json
                → set bucket cooldown (exponential backoff)
                → pick key from different bucket
                → write auth.json only (atomic, no restart)
-#Concurrency Note
+##Concurrency Note
 With maxConcurrent: 4 and subagents.maxConcurrent: 8, up to 12 parallel requests can hit the same key. At 15 RPM free tier, one burst exhausts a key instantly.
 While testing rotation, set maxConcurrent: 1 in openclaw.json.
-#Configuration
-SettingDefaultDescription BACKOFF_BASE_SECONDS15 First cooldown duration BACKOFF_MAX_SECONDS600 Maximum cooldown (10 min cap) BACKOFF_JITTER_MAX2.0 Random jitter(seconds) KEY_COOLDOWN_SECONDS65 Per-key cooldown for non-bucket providers MIN_ROTATION_INTERVAL 5 Minimum seconds between rotations POLL_INTERVAL 30 Health check interval in polling mode
+##Configuration
+SettingDefaultDescription BACKOFF_BASE_SECONDS15 First cooldown duration BACKOFF_MAX_SECONDS 600 Maximum cooldown (10 min cap) BACKOFF_JITTER_MAX2.0 Random jitter(seconds) KEY_COOLDOWN_SECONDS65 Per-key cooldown for non-bucket providers MIN_ROTATION_INTERVAL 5 Minimum seconds between rotations POLL_INTERVAL 30 Health check interval in polling mode
 
 #Requirements
 
 Python 3.8+
 OpenClaw 2026.2.24+
-#Key Manager v4.0 (auth-profiles.json with bucket metadata)
+##Key Manager v4.0 (auth-profiles.json with bucket metadata)
 
-#Changelog v3.0
+##Changelog v3.0
 
 Bucket-aware rotation (project-level cooldown)
 Exponential backoff with jitter
