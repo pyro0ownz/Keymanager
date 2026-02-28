@@ -365,15 +365,16 @@ Run the tester first to verify your keys, then feed the good ones to the key man
 python3 openclaw_key_manage.py
 ```
 
-##🦐 OpenClaw Key Rotation Daemon v3.0
+## 🦐 OpenClaw Key Rotation Daemon v3.0
 Bucket-aware API key rotation with exponential backoff for OpenClaw (2026.2.24+).
 Watches for rate limit errors and automatically switches to a key from a different Google project (bucket). Cools down the entire project on 429, not just one key. Only writes auth.json — confirmed to take effect without gateway restart.
 Quick Start
 bash# Start the daemon in pipe mode (fastest)
 openclaw logs --follow | python3 key_rotator.py watch
 
-# Or let it auto-detect log locations
+ Or let it auto-detect log locations
 python3 key_rotator.py watch
+```
 Commands
 bashpython3 key_rotator.py              # Show status (default)
 python3 key_rotator.py status       # Show all keys + bucket cooldowns
@@ -382,7 +383,8 @@ python3 key_rotator.py reset        # Reset all cooldowns and error counts
 python3 key_rotator.py test         # Test active key + auto-rotate if bad
 python3 key_rotator.py health       # Quick health ping (no rotation)
 python3 key_rotator.py watch        # Start auto-rotation daemon
-How It Works
+```
+## How It Works
 Error Classification
 Error TypeSignalActionRate limit429, RESOURCE_EXHAUSTED, API rate limit reachedCool down bucket, rotate to different bucketDead keyAPI_KEY_INVALID, PERMISSION_DENIEDMark key dead (errorCount=100), rotateTransient500, 502, 503, UNAVAILABLELog and monitor, no rotation
 Bucket-Level Cooldown
@@ -479,7 +481,7 @@ While testing rotation, set maxConcurrent: 1 or 2 in openclaw.json.
 
 
 ## Configuration
-SettingDefaultDescription BACKOFF_BASE_SECONDS15 First cooldown duration BACKOFF_MAX_SECONDS 600 Maximum cooldown (10 min cap) 
+Setting Default Description BACKOFF_BASE_SECONDS 15 First cooldown duration BACKOFF_MAX_SECONDS 600 Maximum cooldown (10 min cap) 
 BACKOFF_JITTER_MAX2.0 Random jitter(seconds) KEY_COOLDOWN_SECONDS65 Per-key cooldown for non-bucket providers MIN_ROTATION_INTERVAL 5 Minimum seconds between rotations 
 POLL_INTERVAL 30 Health check interval in polling mode
 
